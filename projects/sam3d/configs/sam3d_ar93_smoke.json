@@ -1,0 +1,15 @@
+{
+  "name": "legacy4k_00000001_sam3d_ar93x2",
+  "prompt": "With the right arm, the left arm, the right arm, move red block, green block, blue block to the center and stack green block on red block, blue block on green block.",
+  "inference_type": "image2world",
+  "input_path": "/datahdd/mccxadmin/train_data/legacy4k/legacy4k_00000001/first.png",
+  "sam3d_condition_path": "/datahdd/mccxadmin/cosmos-sam3d-cache/native-smoke/legacy4k/legacy4k_00000001/condition.pt",
+  "resolution": "480,640",
+  "num_output_frames": 185,
+  "num_steps": 4,
+  "enable_autoregressive": true,
+  "chunk_size": 93,
+  "chunk_overlap": 1,
+  "seed": 17,
+  "guidance": 3
+}
