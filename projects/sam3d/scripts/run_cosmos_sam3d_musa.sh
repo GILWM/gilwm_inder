@@ -22,7 +22,9 @@ for key in \
   MCCL_DEBUG_SUBSYS \
   MCCL_PROTOS \
   MCCL_ALGOS \
-  MCCL_BUFFSIZE; do
+  MCCL_BUFFSIZE \
+  MCCL_MIN_NRINGS \
+  MCCL_MAX_NRINGS; do
   if [[ -n "${!key:-}" ]]; then
     mccl_env+=(-e "${key}=${!key}")
   fi
