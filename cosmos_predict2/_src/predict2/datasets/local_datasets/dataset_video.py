@@ -216,7 +216,29 @@ class VideoDataset(Dataset):
     def __len__(self) -> int:
         return len(self.video_paths)
 
-    def _load_video(self, video_path: str) -> tuple[np.ndarray, float]:
+    def _sample_frame_ids(self, total_frames: int) -> np.ndarray:
+        """Choose source-frame indices for one sample.
+
+        Keeping this operation separate lets sidecar modalities (for example
+        robot actions) use the exact same timestamps as the decoded video.
+        """
+
+        if total_frames < self.sequence_length:
+            raise ValueError(
+                f"Video has only {total_frames} frames, at least "
+                f"{self.sequence_length} frames are required."
+            )
+        if self.sampling_mode == "continuous":
+            max_start_idx = total_frames - self.sequence_length
+            start_frame = np.random.randint(0, max_start_idx + 1)
+            return np.arange(start_frame, start_frame + self.sequence_length, dtype=np.int64)
+        # Uniform sampling spans the complete timeline, preserves frame zero,
+        # and includes the last source frame.
+        return np.rint(np.linspace(0, total_frames - 1, self.sequence_length)).astype(np.int64)
+
+    def _load_video_with_frame_ids(
+        self, video_path: str
+    ) -> tuple[np.ndarray, float, np.ndarray, int]:
         vr = VideoReader(video_path, ctx=cpu(0), num_threads=2)
         total_frames = len(vr)
         if total_frames < self.sequence_length:
@@ -225,16 +247,9 @@ class VideoDataset(Dataset):
                 f"at least {self.sequence_length} frames are required."
             )
 
-        if self.sampling_mode == "continuous":
-            max_start_idx = total_frames - self.sequence_length
-            start_frame = np.random.randint(0, max_start_idx + 1)
-            frame_ids = np.arange(start_frame, start_frame + self.sequence_length).tolist()
-        else:
-            # Uniformly sample the complete video timeline. This always preserves
-            # the first frame (index 0) and also includes the final frame.
-            frame_ids = np.rint(np.linspace(0, total_frames - 1, self.sequence_length)).astype(np.int64).tolist()
+        frame_ids = self._sample_frame_ids(total_frames)
 
-        frame_data = vr.get_batch(frame_ids).asnumpy()
+        frame_data = vr.get_batch(frame_ids.tolist()).asnumpy()
         vr.seek(0)  # set video reader point back to 0 to clean up cache
 
         try:
@@ -246,6 +261,10 @@ class VideoDataset(Dataset):
         if self.sampling_mode == "uniform" and total_frames > 1:
             fps = fps * (self.sequence_length - 1) / (total_frames - 1)
         del vr  # delete the reader to avoid memory leak
+        return frame_data, fps, frame_ids, total_frames
+
+    def _load_video(self, video_path: str) -> tuple[np.ndarray, float]:
+        frame_data, fps, _, _ = self._load_video_with_frame_ids(video_path)
         return frame_data, fps
 
     def _setup_caption_format(self) -> None:
@@ -321,12 +340,21 @@ class VideoDataset(Dataset):
             log.warning(f"Failed to read JSON caption file {json_path}: {e}")
             return ""
 
-    def _get_frames(self, video_path: str) -> tuple[torch.Tensor, float]:
-        frames, fps = self._load_video(video_path)
+    def _preprocess_frames(self, frames: np.ndarray) -> torch.Tensor:
         frames = frames.astype(np.uint8)
         frames = torch.from_numpy(frames).permute(0, 3, 1, 2)  # [T, C, H, W]
         frames = self.preprocess(frames)
         frames = torch.clamp(frames * 255.0, 0, 255).to(torch.uint8)
+        return frames
+
+    def _get_frames_with_frame_ids(
+        self, video_path: str
+    ) -> tuple[torch.Tensor, float, np.ndarray, int]:
+        frames, fps, frame_ids, total_frames = self._load_video_with_frame_ids(video_path)
+        return self._preprocess_frames(frames), fps, frame_ids, total_frames
+
+    def _get_frames(self, video_path: str) -> tuple[torch.Tensor, float]:
+        frames, fps, _, _ = self._get_frames_with_frame_ids(video_path)
         return frames, fps
 
     def __getitem__(self, index: int) -> dict | Any:

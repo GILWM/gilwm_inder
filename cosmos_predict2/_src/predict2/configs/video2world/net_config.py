@@ -130,6 +130,10 @@ COSMOS_V1_2B_SAM3D_NET: LazyDict = L(MinimalV1LVGSam3DDiT)(
     # Disabled in the legacy relation-loss experiment. New projected-REPA
     # launches override this to the frozen DINO teacher width (768).
     sam3d_repa_projection_dim=None,
+    # Optional lightweight inverse-dynamics head. Kept None for checkpoint
+    # compatibility; action-supervised launches override it (typically 512).
+    action_supervision_hidden_dim=None,
+    action_dim=14,
     # Full-video DINO features are teacher-only by default.  Set True only to
     # reproduce legacy experiments that exposed future teacher frames as input.
     sam3d_teacher_tokens_as_condition=False,

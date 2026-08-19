@@ -42,6 +42,13 @@ sam3d_dataset = L(SAM3DVideoDataset)(
     repeat_factor=1,
     sam3d_native_index=None,
     sam3d_objects_root=None,
+    # WorldArena/RoboTwin HDF5 trajectories are optional sidecars. They are
+    # enabled explicitly by the action-supervised launcher.
+    action_hdf5_root=None,
+    action_required=False,
+    action_norm_path=None,
+    action_alignment_offset=0,
+    action_validate_vector=True,
 )
 
 sam3d_dataloader = L(get_generic_dataloader)(

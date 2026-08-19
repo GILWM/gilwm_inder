@@ -22,6 +22,11 @@ repa_mode=${SAM3D_REPA_MODE:-projected_cosine}
 repa_layer=${SAM3D_REPA_LAYER:-7}
 repa_temporal_weight=${SAM3D_REPA_TEMPORAL_WEIGHT:-0.25}
 repa_projection_dim=${SAM3D_REPA_PROJECTION_DIM:-768}
+action_loss_weight=${ACTION_LOSS_WEIGHT:-0}
+action_alignment_weight=${ACTION_ALIGNMENT_WEIGHT:-0.1}
+action_feature_layer=${ACTION_FEATURE_LAYER:-7}
+action_hidden_dim=${ACTION_HIDDEN_DIM:-512}
+action_alignment_offset=${ACTION_ALIGNMENT_OFFSET:-0}
 scheduler_cycle=${SCHEDULER_CYCLE_LENGTH:-5000}
 scheduler_warmup=${SCHEDULER_WARMUP_STEPS:-500}
 
@@ -34,6 +39,25 @@ test -d "${base_checkpoint}"
 repa_projection_overrides=()
 if [[ ! "${repa_weight}" =~ ^0+([.]0+)?$ ]]; then
   repa_projection_overrides=("model.config.net.sam3d_repa_projection_dim=${repa_projection_dim}")
+fi
+
+action_overrides=()
+if [[ ! "${action_loss_weight}" =~ ^0+([.]0+)?$ ]]; then
+  action_hdf5_root=${ACTION_HDF5_ROOT:?set ACTION_HDF5_ROOT when ACTION_LOSS_WEIGHT is non-zero}
+  action_norm_path=${ACTION_NORM_PATH:?set ACTION_NORM_PATH when ACTION_LOSS_WEIGHT is non-zero}
+  test -d "${action_hdf5_root}"
+  test -s "${action_norm_path}"
+  action_overrides=(
+    "dataloader_train.dataset.action_hdf5_root=${action_hdf5_root}"
+    "dataloader_train.sampler.dataset.action_hdf5_root=${action_hdf5_root}"
+    "dataloader_train.dataset.action_required=True"
+    "dataloader_train.sampler.dataset.action_required=True"
+    "dataloader_train.dataset.action_norm_path=${action_norm_path}"
+    "dataloader_train.sampler.dataset.action_norm_path=${action_norm_path}"
+    "dataloader_train.dataset.action_alignment_offset=${action_alignment_offset}"
+    "dataloader_train.sampler.dataset.action_alignment_offset=${action_alignment_offset}"
+    "model.config.net.action_supervision_hidden_dim=${action_hidden_dim}"
+  )
 fi
 
 export COSMOS_PROJECT="${repo_root}"
@@ -83,6 +107,10 @@ exec "${repo_root}/projects/sam3d/scripts/run_cosmos_sam3d_musa.sh" \
   model.config.sam3d_repa_layer="${repa_layer}" \
   model.config.sam3d_repa_temporal_weight="${repa_temporal_weight}" \
   "${repa_projection_overrides[@]}" \
+  model.config.action_loss_weight="${action_loss_weight}" \
+  model.config.action_alignment_weight="${action_alignment_weight}" \
+  model.config.action_feature_layer="${action_feature_layer}" \
+  "${action_overrides[@]}" \
   model.config.net.sam3d_teacher_tokens_as_condition=False \
   optimizer.lr="${learning_rate}" \
   optimizer.fused=False \

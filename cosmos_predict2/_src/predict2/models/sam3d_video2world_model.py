@@ -36,6 +36,21 @@ class SAM3DVideo2WorldModelRectifiedFlowConfig(Video2WorldModelRectifiedFlowConf
     sam3d_repa_mode: str = "relation"
     sam3d_repa_grid_size: int = 16
     sam3d_repa_temporal_weight: float = 0.25
+    # Optional inverse-dynamics supervision. The prediction term is MSE in
+    # normalized action space; the alignment term compares per-time latent and
+    # encoded-action directions. Defaults preserve all historical runs.
+    action_loss_weight: float = 0.0
+    action_alignment_weight: float = 0.1
+    action_feature_layer: int = 7
+
+    def __attrs_post_init__(self):
+        super().__attrs_post_init__()
+        if self.sam3d_repa_weight < 0:
+            raise ValueError("sam3d_repa_weight must be non-negative")
+        if self.action_loss_weight < 0 or self.action_alignment_weight < 0:
+            raise ValueError("action loss weights must be non-negative")
+        if self.action_feature_layer < 0:
+            raise ValueError("action_feature_layer must be non-negative")
 
 
 def _resample_tokens(tokens_B_N_D: torch.Tensor, token_count: int) -> torch.Tensor:
@@ -61,6 +76,8 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
         self._pending_sam3d_repa_loss: Optional[torch.Tensor] = None
         self._pending_sam3d_repa_spatial_loss: Optional[torch.Tensor] = None
         self._pending_sam3d_repa_temporal_loss: Optional[torch.Tensor] = None
+        self._pending_action_prediction_loss: Optional[torch.Tensor] = None
+        self._pending_action_alignment_loss: Optional[torch.Tensor] = None
         super().__init__(config)
 
     def add_lora(self, network: torch.nn.Module, *args, **kwargs) -> torch.nn.Module:
@@ -79,6 +96,7 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
             "sam3d_shape_projector",
             "sam3d_pose_projector",
             "sam3d_repa_projector",
+            "action_supervision_head",
             "sam_modality_embeddings",
             "sam_context_block_gates",
         )
@@ -89,6 +107,18 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
                 trainable_condition_parameters += parameter.numel()
         log.info(f"Enabled {trainable_condition_parameters:,} trainable SAM condition-adapter parameters")
         return network
+
+    def _action_supervision_head(self) -> torch.nn.Module:
+        network = self.net
+        head = getattr(network, "action_supervision_head", None)
+        if head is None and hasattr(network, "base_model"):
+            head = getattr(network.base_model, "action_supervision_head", None)
+        if head is None:
+            raise RuntimeError(
+                "action_loss_weight > 0 requires "
+                "model.config.net.action_supervision_hidden_dim to be set"
+            )
+        return head
 
     def _relation_alignment_loss(
         self,
@@ -287,23 +317,46 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
             and self.config.sam3d_repa_weight > 0
             and condition.sam3d_tokens_B_F_N_D is not None
         )
+        collect_action = self.training and self.config.action_loss_weight > 0
+        if collect_action and condition.actions_B_T_D is None:
+            raise RuntimeError(
+                "Action supervision is enabled but the batch has no actions_B_T_D. "
+                "Set dataloader action_hdf5_root/action_required or disable action_loss_weight."
+            )
+        feature_ids = sorted(
+            {
+                *([self.config.sam3d_repa_layer] if collect_repa else []),
+                *([self.config.action_feature_layer] if collect_action else []),
+            }
+        )
         net_result = self.net(
             x_B_C_T_H_W=xt_B_C_T_H_W.to(**self.tensor_kwargs),
             timesteps_B_T=timesteps_B_T,
-            intermediate_feature_ids=[self.config.sam3d_repa_layer] if collect_repa else None,
+            intermediate_feature_ids=feature_ids or None,
             **condition.to_dict(),
         )
-        if collect_repa:
+        feature_by_id: dict[int, torch.Tensor] = {}
+        if feature_ids:
             net_output_B_C_T_H_W, intermediate_features = net_result
+            if len(intermediate_features) != len(feature_ids):
+                raise RuntimeError(
+                    f"Requested DiT features {feature_ids}, received {len(intermediate_features)} tensors"
+                )
+            feature_by_id = dict(zip(feature_ids, intermediate_features))
+        else:
+            net_output_B_C_T_H_W = net_result
+
+        if collect_repa:
+            repa_feature = feature_by_id[self.config.sam3d_repa_layer]
             if self.config.sam3d_repa_mode == "relation":
                 losses = self._relation_alignment_loss(
-                    intermediate_features[-1],
+                    repa_feature,
                     condition.sam3d_tokens_B_F_N_D,
                     latent_frames=xt_B_C_T_H_W.shape[2],
                 )
             elif self.config.sam3d_repa_mode == "projected_cosine":
                 losses = self._projected_cosine_alignment_loss(
-                    intermediate_features[-1],
+                    repa_feature,
                     condition.sam3d_tokens_B_F_N_D,
                     latent_frames=xt_B_C_T_H_W.shape[2],
                     latent_height=xt_B_C_T_H_W.shape[3],
@@ -317,10 +370,22 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
                 self._pending_sam3d_repa_temporal_loss,
             ) = losses
         else:
-            net_output_B_C_T_H_W = net_result
             self._pending_sam3d_repa_loss = None
             self._pending_sam3d_repa_spatial_loss = None
             self._pending_sam3d_repa_temporal_loss = None
+
+        if collect_action:
+            action_losses = self._action_supervision_head()(
+                feature_by_id[self.config.action_feature_layer],
+                condition.actions_B_T_D,
+                latent_frames=xt_B_C_T_H_W.shape[2],
+                valid_B=condition.action_valid_B,
+            )
+            self._pending_action_prediction_loss = action_losses.prediction
+            self._pending_action_alignment_loss = action_losses.alignment
+        else:
+            self._pending_action_prediction_loss = None
+            self._pending_action_alignment_loss = None
         net_output_B_C_T_H_W = net_output_B_C_T_H_W.float()
 
         if condition.is_video and self.config.denoise_replace_gt_frames:
@@ -336,16 +401,34 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
         self._pending_sam3d_repa_loss = None
         self._pending_sam3d_repa_spatial_loss = None
         self._pending_sam3d_repa_temporal_loss = None
+        self._pending_action_prediction_loss = None
+        self._pending_action_alignment_loss = None
         output_batch, diffusion_loss = super().forward(data_batch)
         repa_loss = self._pending_sam3d_repa_loss
         if repa_loss is None:
             repa_loss = diffusion_loss.new_zeros(())
-        total_loss = diffusion_loss + self.config.sam3d_repa_weight * repa_loss
+        action_prediction_loss = self._pending_action_prediction_loss
+        if action_prediction_loss is None:
+            action_prediction_loss = diffusion_loss.new_zeros(())
+        action_alignment_loss = self._pending_action_alignment_loss
+        if action_alignment_loss is None:
+            action_alignment_loss = diffusion_loss.new_zeros(())
+        action_supervision_loss = (
+            action_prediction_loss + self.config.action_alignment_weight * action_alignment_loss
+        )
+        total_loss = (
+            diffusion_loss
+            + self.config.sam3d_repa_weight * repa_loss
+            + self.config.action_loss_weight * action_supervision_loss
+        )
         output_batch["diffusion_loss"] = diffusion_loss
         output_batch["sam3d_repa_loss"] = repa_loss
         if self._pending_sam3d_repa_spatial_loss is not None:
             output_batch["sam3d_repa_spatial_loss"] = self._pending_sam3d_repa_spatial_loss
         if self._pending_sam3d_repa_temporal_loss is not None:
             output_batch["sam3d_repa_temporal_loss"] = self._pending_sam3d_repa_temporal_loss
+        output_batch["action_prediction_loss"] = action_prediction_loss
+        output_batch["action_alignment_loss"] = action_alignment_loss
+        output_batch["action_supervision_loss"] = action_supervision_loss
         output_batch["edm_loss"] = total_loss
         return output_batch, total_loss

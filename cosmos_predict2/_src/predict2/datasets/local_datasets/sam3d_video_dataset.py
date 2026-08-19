@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import traceback
 from pathlib import Path
@@ -15,6 +16,13 @@ import torch
 
 from cosmos_predict2._src.imaginaire.utils import log
 from cosmos_predict2._src.predict2.datasets.local_datasets.dataset_video import VideoDataset
+from cosmos_predict2._src.predict2.datasets.local_datasets.worldarena_action_hdf5 import (
+    ACTION_DIM,
+    ActionNormStats,
+    WorldArenaActionIndex,
+    read_action_sequence,
+    resample_action_sequence,
+)
 
 
 class SAM3DVideoDataset(VideoDataset):
@@ -28,6 +36,15 @@ class SAM3DVideoDataset(VideoDataset):
     and ``sam3d_geometry``.  Shapes are normalized here so the default
     DataLoader collate function remains deterministic.
     """
+
+    @staticmethod
+    def _parse_bool(value: bool | str, name: str) -> bool:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized not in {"true", "false"}:
+                raise ValueError(f"{name} must be true or false, got {value!r}")
+            return normalized == "true"
+        return bool(value)
 
     def __init__(
         self,
@@ -49,6 +66,11 @@ class SAM3DVideoDataset(VideoDataset):
         repeat_factor: int = 1,
         sam3d_native_index: Optional[str] = None,
         sam3d_objects_root: Optional[str] = None,
+        action_hdf5_root: Optional[str] = None,
+        action_required: bool = False,
+        action_norm_path: Optional[str] = None,
+        action_alignment_offset: int = 0,
+        action_validate_vector: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -67,6 +89,13 @@ class SAM3DVideoDataset(VideoDataset):
         self.sam3d_shape_dim = sam3d_shape_dim
         self.sam3d_pose_dim = sam3d_pose_dim
         self.sam3d_objects_root = sam3d_objects_root
+        self.action_hdf5_root = action_hdf5_root
+        self.action_required = self._parse_bool(action_required, "action_required")
+        self.action_alignment_offset = int(action_alignment_offset)
+        self.action_validate_vector = self._parse_bool(action_validate_vector, "action_validate_vector")
+        self.action_norm = ActionNormStats.load(action_norm_path) if action_norm_path else None
+        if self.action_required and self.action_hdf5_root is None:
+            raise ValueError("action_required=True requires action_hdf5_root")
         if repeat_factor < 1:
             raise ValueError(f"repeat_factor must be >= 1, got {repeat_factor}")
 
@@ -117,6 +146,43 @@ class SAM3DVideoDataset(VideoDataset):
                 f"{len(self.sam3d_object_paths)} dataset samples under {self.sam3d_objects_root}"
             )
 
+        self.action_hdf5_paths: list[Optional[str]] = [None] * len(self.video_paths)
+        if self.action_hdf5_root is not None:
+            action_index = WorldArenaActionIndex(self.action_hdf5_root)
+            manifest_overrides = self._manifest_action_overrides()
+            self.action_hdf5_paths = [
+                self._action_path(video_path, action_index, manifest_overrides)
+                for video_path in self.video_paths
+            ]
+            action_count = sum(path is not None and os.path.isfile(path) for path in self.action_hdf5_paths)
+            log.info(
+                f"WorldArena action sidecars: found {action_count} of "
+                f"{len(self.video_paths)} samples under {self.action_hdf5_root}"
+            )
+            if self.action_required:
+                keep_indices = [
+                    index
+                    for index, path in enumerate(self.action_hdf5_paths)
+                    if path is not None and os.path.isfile(path)
+                ]
+                missing_count = len(self.video_paths) - len(keep_indices)
+                self.video_paths = [self.video_paths[index] for index in keep_indices]
+                self.sam3d_condition_paths = [self.sam3d_condition_paths[index] for index in keep_indices]
+                self.sam3d_object_paths = [self.sam3d_object_paths[index] for index in keep_indices]
+                self.action_hdf5_paths = [self.action_hdf5_paths[index] for index in keep_indices]
+                if self.caption_paths is not None:
+                    self.caption_paths = [self.caption_paths[index] for index in keep_indices]
+                log.info(
+                    f"Required action coverage: kept {len(keep_indices)} samples and "
+                    f"excluded {missing_count} missing HDF5 sidecars"
+                )
+                if not self.video_paths:
+                    raise ValueError(
+                        f"No video samples could be paired with HDF5 actions under {self.action_hdf5_root}. "
+                        "The public WorldArena Track 1 HDF5 files do not contain RGB video; "
+                        "provide a paired video dataset with matching episode IDs or manifest paths."
+                    )
+
         # Small-scale memory/stability tests deliberately use a handful of
         # fully native sidecars.  Logical repetition supplies enough local
         # samples for large per-device batches without copying cache files or
@@ -125,6 +191,7 @@ class SAM3DVideoDataset(VideoDataset):
             self.video_paths = self.video_paths * repeat_factor
             self.sam3d_condition_paths = self.sam3d_condition_paths * repeat_factor
             self.sam3d_object_paths = self.sam3d_object_paths * repeat_factor
+            self.action_hdf5_paths = self.action_hdf5_paths * repeat_factor
             if self.caption_paths is not None:
                 self.caption_paths = self.caption_paths * repeat_factor
             log.info(f"Repeated SAM 3D dataset {repeat_factor}x for {len(self.video_paths)} logical samples")
@@ -138,6 +205,74 @@ class SAM3DVideoDataset(VideoDataset):
             return None
         sample = os.path.relpath(os.path.dirname(condition_path), self.sam3d_cache_dir)
         return os.path.join(self.sam3d_objects_root, sample, "sam3d_objects.pt")
+
+    def _manifest_action_overrides(self) -> dict[str, str]:
+        """Read explicit video -> HDF5 pairs from the compact dataset manifest."""
+
+        manifest = Path(self.dataset_dir) / "manifest.jsonl"
+        if not manifest.is_file():
+            return {}
+        result: dict[str, str] = {}
+        for line_number, line in enumerate(manifest.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            video = record.get("video")
+            action = next(
+                (
+                    record.get(key)
+                    for key in ("trajectory_hdf5", "action_hdf5", "hdf5", "actions")
+                    if record.get(key)
+                ),
+                None,
+            )
+            if action is None:
+                continue
+            if not isinstance(video, str) or not isinstance(action, str):
+                raise ValueError(f"{manifest}:{line_number}: invalid video/action path fields")
+            result[os.path.normpath(os.path.join(self.dataset_dir, video))] = action
+        return result
+
+    def _action_path(
+        self,
+        video_path: str,
+        action_index: WorldArenaActionIndex,
+        manifest_overrides: dict[str, str],
+    ) -> Optional[str]:
+        override = manifest_overrides.get(os.path.normpath(video_path))
+        if override is not None:
+            candidate = Path(override)
+            if not candidate.is_absolute():
+                candidate = Path(self.action_hdf5_root) / candidate
+            return str(candidate.resolve())
+        resolved = action_index.resolve(video_path, dataset_root=self.dataset_dir)
+        return str(resolved) if resolved is not None else None
+
+    def _load_actions(
+        self,
+        index: int,
+        video_frame_indices: np.ndarray,
+        video_frame_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        path = self.action_hdf5_paths[index]
+        if path is None or not os.path.isfile(path):
+            if self.action_required:
+                raise FileNotFoundError(path or f"No action sidecar for {self.video_paths[index]}")
+            return (
+                torch.zeros(self.sequence_length, ACTION_DIM, dtype=torch.float32),
+                torch.tensor(False, dtype=torch.bool),
+            )
+        actions = read_action_sequence(path, validate_vector=self.action_validate_vector)
+        actions, _ = resample_action_sequence(
+            actions,
+            target_frames=self.sequence_length,
+            video_frame_indices=video_frame_indices,
+            video_frame_count=video_frame_count,
+            alignment_offset=self.action_alignment_offset,
+        )
+        if self.action_norm is not None:
+            actions = self.action_norm.normalize(actions)
+        return torch.from_numpy(actions.copy()), torch.tensor(True, dtype=torch.bool)
 
     @staticmethod
     def _load_tensor_cache(path: str) -> dict[str, Any]:
@@ -310,7 +445,9 @@ class SAM3DVideoDataset(VideoDataset):
     def __getitem__(self, index: int) -> dict | Any:
         try:
             data: dict[str, Any] = {}
-            video, fps = self._get_frames(self.video_paths[index])
+            video, fps, video_frame_indices, video_frame_count = self._get_frames_with_frame_ids(
+                self.video_paths[index]
+            )
             video = video.permute(1, 0, 2, 3)
             video_path = self.video_paths[index]
             video_basename = os.path.basename(video_path).replace(".mp4", "")
@@ -333,6 +470,10 @@ class SAM3DVideoDataset(VideoDataset):
             data["num_frames"] = self.sequence_length
             data["padding_mask"] = torch.zeros(1, height, width)
             data.update(self._load_condition(index))
+            if self.action_hdf5_root is not None:
+                actions, action_valid = self._load_actions(index, video_frame_indices, video_frame_count)
+                data["actions_B_T_D"] = actions
+                data["action_valid_B"] = action_valid
             return data
         except Exception as error:
             self.num_failed_loads += 1

@@ -28,6 +28,10 @@ class SAM3DVideo2WorldCondition(Video2WorldCondition):
     # (translation xyz, quaternion wxyz, scale xyz).
     sam3d_shape_latents_B_K_N_D: Optional[torch.Tensor] = None
     sam3d_object_pose_B_K_D: Optional[torch.Tensor] = None
+    # Action targets are supervision only. They pass through the conditioner
+    # for device/context-parallel transport but are never added to DiT context.
+    actions_B_T_D: Optional[torch.Tensor] = None
+    action_valid_B: Optional[torch.Tensor] = None
 
 
 class SAM3DVideo2WorldConditioner(GeneralConditioner):
@@ -38,6 +42,8 @@ class SAM3DVideo2WorldConditioner(GeneralConditioner):
         "sam3d_geometry_B_C_H_W",
         "sam3d_shape_latents_B_K_N_D",
         "sam3d_object_pose_B_K_D",
+        "actions_B_T_D",
+        "action_valid_B",
     )
 
     def forward(
@@ -123,5 +129,17 @@ SAM3DVideoPredictionConditioner: LazyDict = L(SAM3DVideo2WorldConditioner)(
         output_key="sam3d_object_pose_B_K_D",
         dropout_rate=0.1,
         dtype="bfloat16",
+    ),
+    actions=L(ReMapkey)(
+        input_key="actions_B_T_D",
+        output_key="actions_B_T_D",
+        dropout_rate=0.0,
+        dtype=None,
+    ),
+    action_valid=L(ReMapkey)(
+        input_key="action_valid_B",
+        output_key="action_valid_B",
+        dropout_rate=0.0,
+        dtype=None,
     ),
 )

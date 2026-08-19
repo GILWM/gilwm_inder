@@ -130,6 +130,10 @@ COSMOS_V1_2B_SAM3D_NET: LazyDict = L(MinimalV1LVGSam3DDiT)(
     # Disabled in the legacy relation-loss experiment. New projected-REPA
     # launches override this to the frozen DINO teacher width (768).
     sam3d_repa_projection_dim=None,
+    # Optional lightweight inverse-dynamics head. Kept None for checkpoint
+    # compatibility; action-supervised launches override it (typically 512).
+    action_supervision_hidden_dim=None,
+    action_dim=14,
 )
 
 mini_net = copy.deepcopy(COSMOS_V1_7B_NET_MININET)

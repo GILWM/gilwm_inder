@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 from cosmos_predict2._src.predict2.conditioner import DataType
 from cosmos_predict2._src.predict2.networks.minimal_v1_lvg_dit import MinimalV1LVGDiT
+from cosmos_predict2._src.predict2.sam3d.action_alignment import TemporalActionAlignmentHead
 
 
 class SpatialConditionTokenizer(nn.Module):
@@ -67,6 +68,7 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
         "sam3d_shape_projector",
         "sam3d_pose_projector",
         "sam3d_repa_projector",
+        "action_supervision_head",
         "sam_modality_embeddings",
         "sam_context_block_gates",
     )
@@ -87,6 +89,8 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
         sam_condition_scale: float = 1.0,
         sam3d_repa_projection_dim: Optional[int] = None,
         sam3d_teacher_tokens_as_condition: bool = False,
+        action_supervision_hidden_dim: Optional[int] = None,
+        action_dim: int = 14,
         **kwargs,
     ):
         crossattn_dim = int(kwargs.get("crossattn_emb_channels", 1024))
@@ -132,6 +136,18 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
             if sam3d_repa_projection_dim is not None
             else None
         )
+        # Kept structurally optional so all existing SAM3D checkpoints remain
+        # loadable without missing action-head parameters. Training launchers
+        # enable it only when action supervision has a non-zero weight.
+        self.action_supervision_head = (
+            TemporalActionAlignmentHead(
+                model_dim=model_channels,
+                action_dim=int(action_dim),
+                hidden_dim=int(action_supervision_hidden_dim),
+            )
+            if action_supervision_hidden_dim is not None
+            else None
+        )
 
         # Modality identity is retained after concatenation.  One zero gate per
         # block follows the PAIWorld-style residual-adapter design and is kept
@@ -151,6 +167,7 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
             "sam3d_shape_projector",
             "sam3d_pose_projector",
             "sam3d_repa_projector",
+            "action_supervision_head",
         ):
             module = getattr(self, name, None)
             if module is None:
