@@ -13,6 +13,21 @@ vae_path="${model_root}/nvidia/Cosmos-Predict2.5-2B/tokenizer.pth"
 torch_home="${workspace}/weights/torch"
 pythonpath="${project}:${project}/packages/cosmos-oss:${project}/packages/cosmos-cuda:${workspace}/third_party/sam3-musa:/usr/local/lib/python3.10/dist-packages:/usr/lib/python3/dist-packages"
 
+mccl_env=()
+for key in \
+  MCCL_IB_GID_INDEX \
+  MCCL_IB_HCA \
+  MCCL_SOCKET_IFNAME \
+  MCCL_DEBUG \
+  MCCL_DEBUG_SUBSYS \
+  MCCL_PROTOS \
+  MCCL_ALGOS \
+  MCCL_BUFFSIZE; do
+  if [[ -n "${!key:-}" ]]; then
+    mccl_env+=(-e "${key}=${!key}")
+  fi
+done
+
 for required in "${python}" "${vae_path}"; do
   if [[ ! -e "${required}" ]]; then
     echo "Required independent runtime artifact is missing: ${required}" >&2
@@ -65,4 +80,5 @@ exec docker run --rm --privileged --network host --ipc host \
   -e "OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}" \
   -e "KMP_DUPLICATE_LIB_OK=${KMP_DUPLICATE_LIB_OK:-TRUE}" \
   -e "MUSA_VISIBLE_DEVICES=${MUSA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}" \
+  "${mccl_env[@]}" \
   "${image}" "${python}" "$@"
