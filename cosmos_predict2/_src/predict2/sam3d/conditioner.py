@@ -28,8 +28,8 @@ class SAM3DVideo2WorldCondition(Video2WorldCondition):
     # (translation xyz, quaternion wxyz, scale xyz).
     sam3d_shape_latents_B_K_N_D: Optional[torch.Tensor] = None
     sam3d_object_pose_B_K_D: Optional[torch.Tensor] = None
-    # Action targets are supervision only. They pass through the conditioner
-    # for device/context-parallel transport but are never added to DiT context.
+    # Frame-aligned action conditions.  They are preserved for both training
+    # and inference; classifier-free text/video dropout never removes them.
     actions_B_T_D: Optional[torch.Tensor] = None
     action_valid_B: Optional[torch.Tensor] = None
 

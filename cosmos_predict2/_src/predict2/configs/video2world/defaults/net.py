@@ -139,6 +139,11 @@ COSMOS_V1_2B_SAM3D_NET: LazyDict = L(MinimalV1LVGSam3DDiT)(
     action_supervision_ffn_multiplier=4,
     action_supervision_pool_grid=2,
     action_dim=14,
+    action_conditioning_enabled=False,
+    action_conditioning_hidden_dim=None,
+    action_conditioning_actions_per_latent=4,
+    action_conditioning_clip=10.0,
+    action_conditioning_scale=0.01,
 )
 
 mini_net = copy.deepcopy(COSMOS_V1_7B_NET_MININET)

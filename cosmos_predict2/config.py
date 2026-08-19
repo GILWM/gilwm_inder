@@ -442,6 +442,10 @@ class InferenceArguments(CommonInferenceArguments):
     """Optional and ignored for TEXT2WORLD. Required path to the image if inference_type is IMAGE2WORLD or video if inference_type is VIDEO2WORLD."""
     sam3d_condition_path: ResolvedFilePath | None = None
     """Optional fixed-shape condition.pt containing DINO, SAM masks, geometry, native SAM 3D shape latents and poses."""
+    action_hdf5_path: ResolvedFilePath | None = None
+    """Optional WorldArena trajectory HDF5. Its official 14-D joint_action fields condition every generated frame."""
+    action_norm_path: ResolvedFilePath | None = None
+    """Z-score statistics used for action training. Required with action_hdf5_path so train/inference normalization matches."""
 
     # Advanced parameters
     resolution: str = "480,640"
@@ -485,6 +489,8 @@ class InferenceArguments(CommonInferenceArguments):
                 raise ValueError(
                     f"input_path has unsupported file extension '{self.input_path.suffix}' for inference type {self.inference_type}. Supported extensions: {supported_extensions}"
                 )
+        if (self.action_hdf5_path is None) != (self.action_norm_path is None):
+            raise ValueError("action_hdf5_path and action_norm_path must be provided together")
         return self
 
     @cached_property

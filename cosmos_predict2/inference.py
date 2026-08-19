@@ -24,6 +24,11 @@ from cosmos_predict2._src.imaginaire.lazy_config.lazy import LazyConfig
 from cosmos_predict2._src.imaginaire.utils import distributed, log
 from cosmos_predict2._src.imaginaire.visualize.video import save_img_or_video
 from cosmos_predict2._src.predict2.inference.video2world import Video2WorldInference
+from cosmos_predict2._src.predict2.datasets.local_datasets.worldarena_action_hdf5 import (
+    ActionNormStats,
+    read_action_sequence,
+    resample_action_sequence,
+)
 from cosmos_predict2.config import InferenceArguments, SetupArguments, path_to_str
 
 
@@ -92,6 +97,19 @@ class Inference:
     def _generate_sample(self, sample: InferenceArguments, output_dir: Path) -> str | None:
         log.debug(f"{sample.__class__.__name__}({sample})")
         output_path = output_dir / sample.name
+        action = None
+        if sample.action_hdf5_path is not None:
+            raw_action = read_action_sequence(sample.action_hdf5_path, validate_vector=False)
+            aligned_action, action_indices = resample_action_sequence(
+                raw_action,
+                target_frames=sample.num_output_frames,
+            )
+            action = torch.from_numpy(ActionNormStats.load(sample.action_norm_path).normalize(aligned_action))
+            log.info(
+                f"Loaded action condition {sample.action_hdf5_path}: "
+                f"{len(raw_action)} -> {len(aligned_action)} frames, "
+                f"source indices [{int(action_indices[0])}, {int(action_indices[-1])}]"
+            )
 
         if self.rank0:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -128,6 +146,7 @@ class Inference:
                 resolution=sample.resolution,
                 seed=sample.seed,
                 negative_prompt=sample.negative_prompt,
+                action=action,
                 num_steps=sample.num_steps,
             )
         else:
@@ -142,6 +161,7 @@ class Inference:
                 resolution=sample.resolution,
                 seed=sample.seed,
                 negative_prompt=sample.negative_prompt,
+                action=action,
                 num_steps=sample.num_steps,
             )
 

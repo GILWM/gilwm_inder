@@ -468,14 +468,22 @@ class Video2WorldInference:
         """
         B, C, T, H, W = video.shape
 
+        if action is not None and (action.ndim != 2 or action.shape[0] != T):
+            raise ValueError(f"action must be frame-aligned [T,D] with T={T}, got {tuple(action.shape)}")
+        action_B_T_D = action.unsqueeze(0).expand(B, -1, -1) if action is not None else None
         data_batch = {
             "dataset_name": "video_data",
             "video": video,
-            "action": action.unsqueeze(0) if action is not None else None,
+            "action": action_B_T_D,
             "fps": torch.randint(16, 32, (self.batch_size,)).float(),  # Random FPS (might be used by model)
             "padding_mask": torch.zeros(self.batch_size, 1, H, W),  # Padding mask (assumed no padding here)
             "num_conditional_frames": num_conditional_frames,  # Specify number of conditional frames
         }
+        if action is not None:
+            # Official action models consume `action`; the SAM3D action-
+            # conditioned model consumes these explicit conditioner keys.
+            data_batch["actions_B_T_D"] = action_B_T_D
+            data_batch["action_valid_B"] = torch.ones(B, dtype=torch.bool)
         if sam3d_conditions is not None:
             data_batch.update(sam3d_conditions)
         if camera is not None:
@@ -627,6 +635,10 @@ class Video2WorldInference:
 
         # Prepare the data batch with text embeddings
         # Note: TextEncoder.compute_text_embeddings_online() will automatically move its model to GPU
+        if action is not None and (action.ndim != 2 or action.shape[0] != model_required_frames):
+            raise ValueError(
+                f"Single-chunk action must be [{model_required_frames},D], got {tuple(action.shape)}"
+            )
         data_batch = self._get_data_batch_input(
             video=vid_input,
             prompt=prompt,
@@ -892,6 +904,11 @@ class Video2WorldInference:
         # Initialize output
         generated_chunks = []
 
+        if action is not None and (action.ndim != 2 or action.shape[0] != num_output_frames):
+            raise ValueError(
+                f"Autoregressive action must be [{num_output_frames},D], got {tuple(action.shape)}"
+            )
+
         # Calculate number of chunks
         # Note: All chunks generate chunk_size frames, we store all of chunk 0 and (chunk_size - chunk_overlap) from others
         # Total stored = chunk_size + (num_chunks - 1) * (chunk_size - chunk_overlap) >= num_output_frames
@@ -947,6 +964,17 @@ class Video2WorldInference:
                 chunk_latent_conditional = self.model.tokenizer.get_latent_num_frames(chunk_overlap)
 
             # Generate chunk
+            chunk_action = None
+            if action is not None:
+                chunk_action = action[start_frame:end_frame]
+                if actual_chunk_size < model_required_frames:
+                    chunk_action = torch.cat(
+                        [
+                            chunk_action,
+                            chunk_action[-1:].repeat(model_required_frames - actual_chunk_size, 1),
+                        ],
+                        dim=0,
+                    )
             chunk_video = self.generate_vid2world(
                 prompt=prompt,
                 input_path=chunk_input,
@@ -958,7 +986,7 @@ class Video2WorldInference:
                 seed=seed + chunk_idx,
                 negative_prompt=negative_prompt,
                 camera=camera,
-                action=action,
+                action=chunk_action,
                 num_steps=num_steps,
             )  # Returns (1, C, T, H, W)
 

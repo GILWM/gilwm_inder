@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed._composable.fsdp import fully_shard
 
 from cosmos_predict2._src.predict2.conditioner import DataType
 from cosmos_predict2._src.predict2.networks.minimal_v1_lvg_dit import MinimalV1LVGDiT
@@ -58,6 +59,116 @@ class ConditionProjector(nn.Module):
         return self.proj(self.norm(tokens_B_N_D))
 
 
+class ActionChunkConditioner(nn.Module):
+    """Map frame-aligned robot actions to Cosmos temporal conditioning.
+
+    A causal 4x VAE maps ``4N+1`` RGB frames to ``N+1`` latent frames.  The
+    first latent is the observed condition frame; each later latent receives
+    the four actions attached to its four newly generated RGB frames.  The
+    stable MUSA path injects a bounded residual into the per-latent timestep
+    embedding only; direct AdaLN residuals were unstable at large FSDP batch
+    sizes.
+
+    The MLP uses ordinary initialization and a small fixed residual scale so it
+    receives gradients from the first optimization step without a learned
+    zero gate.
+    """
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        model_dim: int,
+        actions_per_latent: int = 4,
+        hidden_dim: Optional[int] = None,
+        action_clip: Optional[float] = 10.0,
+        residual_scale: float = 0.01,
+    ) -> None:
+        super().__init__()
+        if min(action_dim, model_dim, actions_per_latent) <= 0:
+            raise ValueError("action_dim, model_dim, and actions_per_latent must be positive")
+        self.action_dim = int(action_dim)
+        self.model_dim = int(model_dim)
+        self.actions_per_latent = int(actions_per_latent)
+        if action_clip is not None and float(action_clip) <= 0:
+            raise ValueError(f"action_clip must be positive or None, got {action_clip}")
+        self.action_clip = float(action_clip) if action_clip is not None else None
+        if float(residual_scale) < 0:
+            raise ValueError(f"residual_scale must be non-negative, got {residual_scale}")
+        self.residual_scale = float(residual_scale)
+        hidden_dim = int(hidden_dim) if hidden_dim is not None else self.model_dim * 4
+        input_dim = self.action_dim * self.actions_per_latent
+        activation = nn.GELU(approximate="tanh")
+        self.timestep_embedder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            activation,
+            nn.Linear(hidden_dim, self.model_dim),
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        self.timestep_embedder[0].reset_parameters()
+        self.timestep_embedder[2].reset_parameters()
+
+    def forward(
+        self,
+        actions_B_T_D: torch.Tensor,
+        *,
+        latent_frames: int,
+        action_valid_B: Optional[torch.Tensor] = None,
+        condition_video_input_mask_B_C_T_H_W: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, None]:
+        if actions_B_T_D.ndim != 3 or actions_B_T_D.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"actions must be [B,T,{self.action_dim}], got {tuple(actions_B_T_D.shape)}"
+            )
+        if latent_frames < 1:
+            raise ValueError(f"latent_frames must be positive, got {latent_frames}")
+        expected_frames = 1 + (latent_frames - 1) * self.actions_per_latent
+        if actions_B_T_D.shape[1] != expected_frames:
+            raise ValueError(
+                "Frame/action alignment mismatch: "
+                f"{latent_frames} latent frames require {expected_frames} frame-aligned actions "
+                f"(1 + ({latent_frames}-1)*{self.actions_per_latent}), "
+                f"got {actions_B_T_D.shape[1]}"
+            )
+
+        batch_size = actions_B_T_D.shape[0]
+        parameter = self.timestep_embedder[0].weight
+        # action[t] is paired with RGB frame[t].  RGB frame zero is already
+        # observed, so groups [1:5], [5:9], ... condition future latents.
+        future = actions_B_T_D[:, 1:].to(device=parameter.device, dtype=parameter.dtype)
+        if self.action_clip is not None:
+            future = future.clamp(min=-self.action_clip, max=self.action_clip)
+        chunks = future.reshape(batch_size, latent_frames - 1, -1)
+        # Normalize each action residual before applying a small fixed scale.
+        # A learned zero gate looks attractive for exact step-zero parity, but
+        # its first non-zero Adam update is rank-locally unstable with MUSA
+        # FSDP2 at large batch sizes.  A fixed residual scale keeps the signal
+        # bounded while allowing the MLP to learn from the first step.
+        timestep = self.timestep_embedder(chunks)
+        timestep = F.layer_norm(timestep, (self.model_dim,)) * self.residual_scale
+        timestep = F.pad(timestep, (0, 0, 1, 0))
+
+        if action_valid_B is not None:
+            valid = action_valid_B.to(device=timestep.device, dtype=timestep.dtype).reshape(-1, 1, 1)
+            if valid.shape[0] != batch_size:
+                raise ValueError(f"action_valid_B must contain {batch_size} values, got {valid.shape[0]}")
+            timestep = timestep * valid
+
+        if condition_video_input_mask_B_C_T_H_W is not None:
+            mask = condition_video_input_mask_B_C_T_H_W
+            if mask.shape[0] != batch_size or mask.shape[2] != latent_frames:
+                raise ValueError(
+                    "condition video mask must match action batch/latent time, "
+                    f"got {tuple(mask.shape)} for B={batch_size}, T={latent_frames}"
+                )
+            generated = 1.0 - mask[:, :1, :, :1, :1].reshape(batch_size, latent_frames, 1)
+            generated = generated.to(device=timestep.device, dtype=timestep.dtype)
+            timestep = timestep * generated
+        return timestep, None
+
+
 class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
     """MinimalV1LVGDiT with a structured frozen-teacher context branch."""
 
@@ -72,6 +183,7 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
         "sam3d_pose_projector",
         "sam3d_repa_projector",
         "action_supervision_head",
+        "action_chunk_conditioner",
         "sam_modality_embeddings",
         "sam_context_block_gates",
     )
@@ -99,6 +211,11 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
         action_supervision_ffn_multiplier: int = 4,
         action_supervision_pool_grid: int = 2,
         action_dim: int = 14,
+        action_conditioning_enabled: bool = False,
+        action_conditioning_hidden_dim: Optional[int] = None,
+        action_conditioning_actions_per_latent: int = 4,
+        action_conditioning_clip: Optional[float] = 10.0,
+        action_conditioning_scale: float = 0.01,
         **kwargs,
     ):
         crossattn_dim = int(kwargs.get("crossattn_emb_channels", 1024))
@@ -171,6 +288,28 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
                 ffn_multiplier=int(action_supervision_ffn_multiplier),
                 pool_grid=int(action_supervision_pool_grid),
             )
+        if isinstance(action_conditioning_enabled, str):
+            normalized = action_conditioning_enabled.strip().lower()
+            if normalized not in {"true", "false"}:
+                raise ValueError(
+                    "action_conditioning_enabled must be true or false, "
+                    f"got {action_conditioning_enabled!r}"
+                )
+            self.action_conditioning_enabled = normalized == "true"
+        else:
+            self.action_conditioning_enabled = bool(action_conditioning_enabled)
+        self.action_chunk_conditioner = (
+            ActionChunkConditioner(
+                action_dim=int(action_dim),
+                model_dim=model_channels,
+                actions_per_latent=int(action_conditioning_actions_per_latent),
+                hidden_dim=action_conditioning_hidden_dim,
+                action_clip=action_conditioning_clip,
+                residual_scale=action_conditioning_scale,
+            )
+            if self.action_conditioning_enabled
+            else None
+        )
 
         # Modality identity is retained after concatenation.  One zero gate per
         # block follows the PAIWorld-style residual-adapter design and is kept
@@ -191,9 +330,13 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
             "sam3d_pose_projector",
             "sam3d_repa_projector",
             "action_supervision_head",
+            "action_chunk_conditioner",
         ):
             module = getattr(self, name, None)
             if module is None:
+                continue
+            if name == "action_chunk_conditioner":
+                module.reset_parameters()
                 continue
             for child in module.modules():
                 if child is module:
@@ -213,6 +356,23 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
         # build_net calls it again after meta tensors are materialized.
         super().init_weights()
         self._init_condition_weights()
+
+    def fully_shard(self, mesh, **fsdp_kwargs):
+        """Shard the large action conditioner as its own FSDP unit.
+
+        Leaving its roughly 19M parameters in the top-level catch-all FSDP
+        group produced peer-rank NaNs on the current MUSA FSDP2 build. Cosmos
+        already gives every large transformer block its own FSDP unit; apply
+        the same rule to the action MLP.
+        """
+        if self.action_chunk_conditioner is not None:
+            fully_shard(
+                self.action_chunk_conditioner,
+                mesh=mesh,
+                reshard_after_forward=True,
+                **fsdp_kwargs,
+            )
+        return super().fully_shard(mesh, **fsdp_kwargs)
 
     @staticmethod
     def _flatten_teacher_frames(tokens: torch.Tensor) -> torch.Tensor:
@@ -353,6 +513,8 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
         sam3d_geometry_B_C_H_W: Optional[torch.Tensor] = None,
         sam3d_shape_latents_B_K_N_D: Optional[torch.Tensor] = None,
         sam3d_object_pose_B_K_D: Optional[torch.Tensor] = None,
+        actions_B_T_D: Optional[torch.Tensor] = None,
+        action_valid_B: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         del kwargs
@@ -374,6 +536,20 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
             sam3d_object_pose_B_K_D=sam3d_object_pose_B_K_D,
         )
 
+        action_timestep = None
+        action_adaln = None
+        if self.action_chunk_conditioner is not None:
+            if actions_B_T_D is None:
+                raise RuntimeError(
+                    "This checkpoint is action-conditioned, but inference/training did not provide actions_B_T_D"
+                )
+            action_timestep, action_adaln = self.action_chunk_conditioner(
+                actions_B_T_D,
+                latent_frames=x_B_C_T_H_W.shape[2],
+                action_valid_B=action_valid_B,
+                condition_video_input_mask_B_C_T_H_W=condition_video_input_mask_B_C_T_H_W,
+            )
+
         return super().forward(
             x_B_C_T_H_W=x_B_C_T_H_W,
             timesteps_B_T=timesteps_B_T,
@@ -387,4 +563,6 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
             crossattn_already_projected=crossattn_already_projected,
             sam_context_emb=sam_context_emb,
             sam_context_block_gates=self.sam_context_block_gates * self.sam_condition_scale,
+            t_embedding_addition_B_T_D=action_timestep,
+            adaln_lora_addition_B_T_3D=action_adaln,
         )

@@ -33,6 +33,12 @@ action_num_heads=${ACTION_NUM_HEADS:-8}
 action_ffn_multiplier=${ACTION_FFN_MULTIPLIER:-4}
 action_pool_grid=${ACTION_POOL_GRID:-2}
 action_alignment_offset=${ACTION_ALIGNMENT_OFFSET:-0}
+action_validate_vector=${ACTION_VALIDATE_VECTOR:-true}
+action_conditioning_enabled=${ACTION_CONDITIONING_ENABLED:-false}
+action_conditioning_hidden_dim=${ACTION_CONDITIONING_HIDDEN_DIM:-8192}
+action_conditioning_actions_per_latent=${ACTION_CONDITIONING_ACTIONS_PER_LATENT:-4}
+action_conditioning_clip=${ACTION_CONDITIONING_CLIP:-10.0}
+action_conditioning_scale=${ACTION_CONDITIONING_SCALE:-0.01}
 manifest_paths=${DATASET_MANIFEST_PATHS:-}
 included_batches=${INCLUDED_BATCHES:-"['legacy4k','core15k']"}
 sam3d_required=${SAM3D_REQUIRED:-true}
@@ -68,11 +74,11 @@ if [[ ! "${repa_weight}" =~ ^0+([.]0+)?$ ]]; then
 fi
 
 action_overrides=()
-if [[ ! "${action_loss_weight}" =~ ^0+([.]0+)?$ ]]; then
+if [[ "${action_conditioning_enabled,,}" == "true" || ! "${action_loss_weight}" =~ ^0+([.]0+)?$ ]]; then
   action_hdf5_root=${ACTION_HDF5_ROOT:-}
-  action_norm_path=${ACTION_NORM_PATH:?set ACTION_NORM_PATH when ACTION_LOSS_WEIGHT is non-zero}
+  action_norm_path=${ACTION_NORM_PATH:?set ACTION_NORM_PATH when action conditioning/supervision is enabled}
   if [[ -z "${action_hdf5_root}" && -z "${manifest_paths}" ]]; then
-    echo "set ACTION_HDF5_ROOT or DATASET_MANIFEST_PATHS when ACTION_LOSS_WEIGHT is non-zero" >&2
+    echo "set ACTION_HDF5_ROOT or DATASET_MANIFEST_PATHS when action conditioning/supervision is enabled" >&2
     exit 2
   fi
   if [[ -n "${action_hdf5_root}" ]]; then test -d "${action_hdf5_root}"; fi
@@ -84,12 +90,13 @@ if [[ ! "${action_loss_weight}" =~ ^0+([.]0+)?$ ]]; then
     "dataloader_train.sampler.dataset.action_norm_path=${action_norm_path}"
     "dataloader_train.dataset.action_alignment_offset=${action_alignment_offset}"
     "dataloader_train.sampler.dataset.action_alignment_offset=${action_alignment_offset}"
-    "model.config.net.action_supervision_hidden_dim=${action_hidden_dim}"
-    "model.config.net.action_supervision_architecture=${action_architecture}"
-    "model.config.net.action_supervision_num_layers=${action_num_layers}"
-    "model.config.net.action_supervision_num_heads=${action_num_heads}"
-    "model.config.net.action_supervision_ffn_multiplier=${action_ffn_multiplier}"
-    "model.config.net.action_supervision_pool_grid=${action_pool_grid}"
+    "dataloader_train.dataset.action_validate_vector=${action_validate_vector}"
+    "dataloader_train.sampler.dataset.action_validate_vector=${action_validate_vector}"
+    "model.config.net.action_conditioning_enabled=${action_conditioning_enabled}"
+    "model.config.net.action_conditioning_hidden_dim=${action_conditioning_hidden_dim}"
+    "model.config.net.action_conditioning_actions_per_latent=${action_conditioning_actions_per_latent}"
+    "model.config.net.action_conditioning_clip=${action_conditioning_clip}"
+    "model.config.net.action_conditioning_scale=${action_conditioning_scale}"
   )
   if [[ -n "${action_hdf5_root}" ]]; then
     action_overrides+=(
@@ -97,8 +104,18 @@ if [[ ! "${action_loss_weight}" =~ ^0+([.]0+)?$ ]]; then
       "dataloader_train.sampler.dataset.action_hdf5_root=${action_hdf5_root}"
     )
   fi
-  if [[ -n "${action_feature_layers}" ]]; then
-    action_overrides+=("model.config.action_feature_layers=${action_feature_layers}")
+  if [[ ! "${action_loss_weight}" =~ ^0+([.]0+)?$ ]]; then
+    action_overrides+=(
+      "model.config.net.action_supervision_hidden_dim=${action_hidden_dim}"
+      "model.config.net.action_supervision_architecture=${action_architecture}"
+      "model.config.net.action_supervision_num_layers=${action_num_layers}"
+      "model.config.net.action_supervision_num_heads=${action_num_heads}"
+      "model.config.net.action_supervision_ffn_multiplier=${action_ffn_multiplier}"
+      "model.config.net.action_supervision_pool_grid=${action_pool_grid}"
+    )
+    if [[ -n "${action_feature_layers}" ]]; then
+      action_overrides+=("model.config.action_feature_layers=${action_feature_layers}")
+    fi
   fi
 fi
 

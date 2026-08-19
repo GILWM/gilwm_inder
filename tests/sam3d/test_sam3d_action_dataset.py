@@ -81,6 +81,9 @@ def test_multiple_filtered_manifests_resolve_video_caption_and_action_paths():
         item = dataset[0]
         assert item["actions_B_T_D"].shape == (93, 14)
         assert item["action_valid_B"].item() is True
+        source_indices = np.rint(np.linspace(0, 120, 93)).astype(np.int64)
+        source_actions = read_action_sequence(Path(dataset.action_hdf5_paths[0]))
+        np.testing.assert_allclose(item["actions_B_T_D"].numpy(), source_actions[source_indices])
 
 
 def run_probe(action_root: Path, source_video: Path) -> None:

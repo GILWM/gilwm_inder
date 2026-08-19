@@ -149,17 +149,35 @@ def aligned_action_indices(
     if video_frame_indices is None:
         positions = np.linspace(0, action_frames - 1, target_frames, dtype=np.float64)
     else:
-        video_indices = np.asarray(video_frame_indices, dtype=np.float64)
-        if video_indices.shape != (target_frames,):
+        raw_video_indices = np.asarray(video_frame_indices)
+        if raw_video_indices.shape != (target_frames,):
             raise ValueError(
-                f"Expected {target_frames} video frame indices, got {video_indices.shape}"
+                f"Expected {target_frames} video frame indices, got {raw_video_indices.shape}"
             )
         if video_frame_count is None or video_frame_count < 1:
             raise ValueError("video_frame_count is required with video_frame_indices")
-        if video_frame_count == 1:
+        video_indices_f64 = raw_video_indices.astype(np.float64)
+        if not np.isfinite(video_indices_f64).all():
+            raise ValueError("video_frame_indices contains NaN or Inf")
+        video_indices = np.rint(video_indices_f64).astype(np.int64)
+        if not np.array_equal(video_indices_f64, video_indices.astype(np.float64)):
+            raise ValueError("video_frame_indices must contain integer source-frame indices")
+        if np.any(video_indices < 0) or np.any(video_indices >= video_frame_count):
+            raise ValueError(
+                f"video_frame_indices must be within [0,{video_frame_count - 1}], "
+                f"got [{video_indices.min()},{video_indices.max()}]"
+            )
+        if np.any(np.diff(video_indices) < 0):
+            raise ValueError("video_frame_indices must be monotonically non-decreasing")
+
+        # This is the common paired-data case. Use the exact decoded video
+        # indices with no floating-point timestamp conversion whatsoever.
+        if action_frames == video_frame_count:
+            positions = video_indices
+        elif video_frame_count == 1:
             positions = np.zeros(target_frames, dtype=np.float64)
         else:
-            positions = video_indices / float(video_frame_count - 1) * float(action_frames - 1)
+            positions = video_indices.astype(np.float64) / float(video_frame_count - 1) * float(action_frames - 1)
 
     indices = np.rint(positions).astype(np.int64)
     indices += int(alignment_offset)

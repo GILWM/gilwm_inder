@@ -42,6 +42,8 @@ class MinimalV1LVGDiT(MiniTrainDIT):
         crossattn_already_projected: bool = False,
         sam_context_emb: Optional[torch.Tensor] = None,
         sam_context_block_gates: Optional[torch.Tensor] = None,
+        t_embedding_addition_B_T_D: Optional[torch.Tensor] = None,
+        adaln_lora_addition_B_T_3D: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         del kwargs
@@ -65,4 +67,6 @@ class MinimalV1LVGDiT(MiniTrainDIT):
             crossattn_already_projected=crossattn_already_projected,
             sam_context_emb=sam_context_emb,
             sam_context_block_gates=sam_context_block_gates,
+            t_embedding_addition_B_T_D=t_embedding_addition_B_T_D,
+            adaln_lora_addition_B_T_3D=adaln_lora_addition_B_T_3D,
         )

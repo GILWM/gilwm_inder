@@ -63,6 +63,7 @@ class IterSpeed(EveryN):
                 "action_prediction_loss",
                 "action_alignment_loss",
                 "action_supervision_loss",
+                "action_conditioning_scale",
             )
             if key in output_batch and output_batch[key].numel() == 1
         )
@@ -106,6 +107,7 @@ class IterSpeed(EveryN):
                 "action_prediction_loss",
                 "action_alignment_loss",
                 "action_supervision_loss",
+                "action_conditioning_scale",
             )
             if key in output_batch and output_batch[key].numel() == 1
         )

@@ -1,137 +1,104 @@
-# Cosmos 原生 Action Expert 设计
+# Cosmos + SAM3D 的 Action-Conditioned 生成
 
 ## 结论
 
-本实现保留 FlowWAM 的核心结构：动作 token 自注意力、逐层读取视频 DiT
-特征、逐时刻预测动作。它不复刻 Wan 的 3072 维接口，而是原生使用
-Cosmos 2B 的 2048 维特征，并在交叉注意力前压缩空间 token。
+当前版本把 action 作为视频生成条件，同时用于训练和推理。它不再把 action 仅作为 inverse-dynamics 的预测目标：归一化后的 14 维 action 会进入 Cosmos DiT 的 timestep embedding，因此相同首帧、提示词和随机种子在使用不同 action 时可以生成不同运动。
 
-旧的 `TemporalActionAlignmentHead` 仍是默认值。只有显式设置
-`ACTION_ARCHITECTURE=cosmos_action_expert` 才会构建新网络，因此旧配置、旧
-checkpoint 和纯推理都不受影响。
+旧的 Action Expert 预测头仍保留用于 checkpoint 兼容和可选消融，但正式 action-conditioned 训练默认设置 `ACTION_LOSS_WEIGHT=0`，总目标就是原本的 rectified-flow 视频扩散 loss。这样没有额外的 action MSE/cosine loss，也不会让一个辅助目标压过视频生成目标。
 
-## 张量流
+## 时间对齐与张量形状
 
-以当前 93 帧、480x640 训练为例：
-
-1. VAE 时间压缩后约为 24 个 latent 帧。
-2. Cosmos 空间 patch 后，每个 DiT 中间层约为
-   `[B, 24*30*40, 2048] = [B, 28800, 2048]`。
-3. 从 DiT 的第 `[3, 7, 11, 15, 19, 23]` 层取特征；每帧恢复为真实
-   `30x40` 网格，再自适应池化到 `2x2`。
-4. 每个来源层的上下文变为 `[B, 24*4, 512] = [B, 96, 512]`，共享
-   `2048 -> 512` 投影。
-5. 固定时间 query 为 `[B, 24, 512]`，叠加位置编码和视频扩散 timestep
-   编码。
-6. 6 个 Action Expert block 依次执行动作自注意力、视频交叉注意力和
-   FFN；第 i 个 block 对应读取一层 Cosmos 特征。
-7. 输出 `[B, 24, 14]`，监督动作按相同时间轴从原始动作序列均匀取样。
-
-动作真值不会作为 query 输入，只在 loss 端使用。这一点避免了把干净动作
-送进网络后直接复制答案的问题；该网络仍然是 inverse-dynamics 监督，不是
-推理时依赖未来动作的 action-conditioned 生成器。
-
-默认网络为 512 hidden、8 heads、6 blocks、FFN 倍率 4，约 2700 万参数。
-相比 FlowWAM 的约 7.78 亿 Action Expert，它保留了逐层视频读取能力，但将
-参数量和交叉注意力 token 数控制在适合现有 80G 卡训练的范围内。
-
-## Loss
+当前训练使用 93 个像素帧。因果 VAE 进行 4 倍时间压缩后得到 24 个 latent 帧：
 
 ```text
-L_total = L_diffusion
-        + action_loss_weight * (
-              L_action_mse
-            + action_alignment_weight * L_action_cosine
-          )
+pixel/action: 0 | 1 2 3 4 | 5 6 7 8 | ... | 89 90 91 92
+latent:       0 |    1    |    2    | ... |      23
 ```
 
-- `L_action_mse`：预测的归一化 14D 动作与对应时刻真值的 MSE。
-- `L_action_cosine`：最终 action token 与独立 action target encoder 的逐时刻
-  cosine distance。
-- 视频扩散 timestep 直接进入 action query，使同一个 head 能解释不同噪声
-  强度下的 Cosmos 中间特征。
+- action 与视频先使用完全相同的源帧整数索引抽取，得到 `[B,93,14]`。
+- 第 0 帧已经是观测到的首帧，不需要 action 生成；第 1～4 帧的 action 拼为 latent 1 的条件，第 5～8 帧对应 latent 2，以此类推。
+- 每组 4 个 action 先拼成 56 维，经 MLP 得到 `[B,23,2048]` 的未来 timestep 增量；在首帧位置补零后成为 `[B,24,2048]`。当前稳定版本不生成或注入额外的 AdaLN 增量。
+- action MLP 正常初始化，输出先做无参数 LayerNorm，再乘固定的 `action_conditioning_scale=0.01`，加入每个 latent 时刻的 timestep embedding，随后继续经过 Cosmos 自己的 timestep RMSNorm。这里不用“从 0 学起”的门控，也不把 6144 维 action 残差绕过归一化直接加到每层 AdaLN：这两种路径在 MUSA FSDP2 大 batch 下会触发 peer-rank NaN。约 1900 万参数的 action MLP 作为独立 FSDP 单元分片。
+- 归一化 action 在进入 MLP 前截到 `[-10,10]`。全量 Core15K 的 34,757,982 个值中只有 347 个超过该范围（约 0.001%），用于阻断少量离群值，不改变绝大多数数据。
+- 启用 action conditioning 后，如果训练或推理没有提供 action，或者长度不是 `1 + (latent_T-1)*4`，程序会直接报错，不能静默退化为无 action 模式。
 
-## 本次训练数据
+## HDF5 读取与归一化
 
-训练入口合并以下两个独立 manifest，不复制视频或 HDF5：
-
-- `core15k_filter_75_455`：13,487 条，其中 12,850 条不少于 93 帧。
-- `robotwin2_filter_75_455`：25,930 条，全部不少于 93 帧。
-- 93 帧训练实际可用合计：38,780 条。
-
-两批数据的 manifest 均已为每条样本提供 14D `actions.hdf5`。多 manifest
-加载器会以各 manifest 所在目录解析视频、instruction 和 action 相对路径。
-
-### HDF5 归一化
-
-当前网络只读取并监督 H5 中的 14 维 `joint_action`：左臂 6 维、左夹爪
-1 维、右臂 6 维、右夹爪 1 维。每一维使用两批可训练数据的全局统计做
-z-score：
+只读取官方四项并按下列顺序组成 14 维向量：
 
 ```text
-action_normalized[d] = (action[d] - mean[d]) / (std[d] + 1e-6)
+joint_action/left_arm       6D
+joint_action/left_gripper   1D
+joint_action/right_arm      6D
+joint_action/right_gripper  1D
 ```
 
-统计覆盖 38,780 个有效 H5、7,828,045 个动作时刻。该处理不是 min-max，
-不会把结果限制到 `[0,1]` 或 `[-1,1]`，也不做 clipping。H5 中的
-`endpose/*`、相机参数、内嵌 RGB 和 pointcloud 当前不送入 Action Expert，
-因此没有在这条训练链路中额外 normalize。
+`joint_action/vector`、`endpose/*`、RGB、相机参数和 pointcloud 等冗余字段全部忽略。每一维使用固定统计做 z-score：
 
-先生成与实际 >=93 帧训练集合严格一致的归一化统计：
-
-```bash
-python projects/sam3d/scripts/audit_worldarena_action_hdf5.py \
-  /datahdd/mccxadmin/train_data/core15k_filter_75_455 \
-  /datahdd/mccxadmin/train_data/robotwin2_filter_75_455 \
-  --min-video-frames 93 \
-  --skip-schema-audit --progress-every 1000 \
-  --expected-count 38780 \
-  --write-norm /datahdd/mccxadmin/train_data/filter_75_455_v93_action_norm_stats.npz \
-  --json-report /datahdd/mccxadmin/train_data/filter_75_455_v93_action_norm_stats.json
+```text
+normalized[d] = (action[d] - mean[d]) / (std[d] + 1e-6)
 ```
 
-训练使用：
-
-```bash
-# 仍需像原训练一样提供 COSMOS_SAM3D_WORKSPACE、SAM3D_BASE_CHECKPOINT、
-# MASTER_ADDR 和各节点 NODE_RANK。
-projects/sam3d/train_action_expert_filter_75_455.sh NODE_RANK
-```
-
-smoke test 可显式设置：
-
-```bash
-NNODES=1 MAX_ITER=3 SAVE_ITER=3 PER_DEVICE_BATCH_SIZE=1 \
-  projects/sam3d/train_action_expert_filter_75_455.sh 0
-```
-
-两个筛选目录中的样本是指向原始数据的符号链接。启动脚本默认通过
-`COSMOS_EXTRA_BIND_PATHS=/datahdd` 将链接目标一并挂入容器；如果数据迁移到
-其他文件系统，可用冒号分隔的绝对路径覆盖该变量。
-
-当前正式实验只训练 Core15K，固定 1000 iter。其入口为：
-
-```bash
-projects/sam3d/train_action_expert_core15k_1k.sh NODE_RANK
-```
-
-默认使用 4 节点、每节点 8 卡、每卡 batch size 4，并在 500/1000 iter 保存。
-启动器会根据 `ens11np0` 在每个节点自动解析对应的 RDMA HCA。当前集群中
-wx25 对应 `mlx5_0`，wx26-wx28 对应 `mlx5_2`，不能在四台机器上统一写死为
-同一个 `MCCL_IB_HCA`。`projects/sam3d/scripts/smoke_mccl_distributed.py`
-可在正式训练前验证多机 broadcast、all-reduce 和 barrier。
-
-动作归一化统计固定来自官方 WorldArena 1000 题，加上本次真正可训练的
-12,850 条 Core15K（`>=93` 帧）样本。Robotwin2 不参加这次训练，也不参与
-这份 normalization 统计。
-
-对应统计文件为：
+当前 Core15K 训练和推理共用：
 
 ```text
 /datahdd/mccxadmin/train_data/official1000_core15k_v93_action_norm_stats.npz
 ```
 
-审计结果为 13,850/13,850 个 H5 有效、0 失败，共 2,713,621 个动作时刻。
+该统计来自官方 WorldArena 1000 题加上可训练的 Core15K 子集。不要在推理时重新计算统计。
 
-完整长任务的 `MAX_ITER`、batch size 和起始 checkpoint 应在 smoke test
-通过后再确定。
+## 对齐审计结果
+
+- Core15K manifest 共 13,487 条，其中 12,850 条不少于 93 帧并进入训练。
+- 12,850/12,850 的 manifest 视频帧数与官方 action 长度相等，并全部通过“视频抽帧索引等于 action 索引”的全量检查。
+- 随机实际解码 128 个 MP4，128/128 的真实帧数、manifest 帧数和 action 长度一致。
+- 全量报告：`/datassd/morka/cosmos-sam3d-work/action-alignment-audit-core15k-all-20260820.json`。
+- 实际解码报告：`/datassd/morka/cosmos-sam3d-work/action-alignment-audit-core15k-128-20260820.json`。
+
+## 训练
+
+Core15K 入口：
+
+```bash
+projects/sam3d/train_action_expert_core15k_1k.sh NODE_RANK
+```
+
+重要环境变量：
+
+```bash
+ACTION_CONDITIONING_ENABLED=true
+ACTION_CONDITIONING_HIDDEN_DIM=8192
+ACTION_LOSS_WEIGHT=0
+NUM_FRAMES=93
+PER_DEVICE_BATCH_SIZE=4
+MAX_ITER=5000
+SAVE_ITER=500
+```
+
+启动器默认使用 4 台机器、每台 8 卡，并依据 `ens11np0` 自动解析每台机器自己的 RDMA HCA（wx25 为 `mlx5_0`，wx26～wx28 为 `mlx5_2`）。
+
+## 推理
+
+每个 JSON/JSONL 推理样本增加两项：
+
+```json
+{
+  "action_hdf5_path": "/path/to/actions.hdf5",
+  "action_norm_path": "/datahdd/mccxadmin/train_data/official1000_core15k_v93_action_norm_stats.npz"
+}
+```
+
+推理会读取官方 14D action，按 `num_output_frames` 均匀映射到生成时间轴并保留第一项。单 chunk 会一次传入完整 action；AR 会按照每个 chunk 的绝对帧区间切片，重叠帧也使用相同绝对时刻的 action。CFG 只改变文本/视频条件的 dropout，action 在正、负分支中保持一致。
+
+加载 action checkpoint 时必须选择实验 `predict2_video2world_inference_2b_sam3d_action`。这个实验会实例化与训练完全相同的 14D→8192→2048 action timestep MLP；仅在 JSON 里填写 `action_hdf5_path`、却使用普通 SAM3D 实验，会导致 action checkpoint 参数没有对应模块可加载。
+
+## 回归测试
+
+`tests/sam3d` 覆盖：
+
+- 视频与 action 精确使用同一组抽帧索引；
+- 冗余 H5 字段不影响官方字段读取；
+- action chunk 严格为 `[1:5]、[5:9]…`，拒绝 92/94 等 off-by-one 长度；
+- `action_conditioning_scale=0` 时 action 分支严格保持原模型输出；
+- 固定小批次可把条件分支 loss 降到初始值 5% 以下；
+- eval/推理路径确实传入 action，改变 action 会改变预测。

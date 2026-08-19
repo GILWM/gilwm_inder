@@ -125,6 +125,13 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
             )
         return head
 
+    def _action_chunk_conditioner(self) -> Optional[torch.nn.Module]:
+        network = self.net
+        conditioner = getattr(network, "action_chunk_conditioner", None)
+        if conditioner is None and hasattr(network, "base_model"):
+            conditioner = getattr(network.base_model, "action_chunk_conditioner", None)
+        return conditioner
+
     def _relation_alignment_loss(
         self,
         student_B_M_D: torch.Tensor,
@@ -441,5 +448,10 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
         output_batch["action_prediction_loss"] = action_prediction_loss
         output_batch["action_alignment_loss"] = action_alignment_loss
         output_batch["action_supervision_loss"] = action_supervision_loss
+        action_conditioner = self._action_chunk_conditioner()
+        if action_conditioner is not None:
+            output_batch["action_conditioning_scale"] = diffusion_loss.new_tensor(
+                action_conditioner.residual_scale
+            )
         output_batch["edm_loss"] = total_loss
         return output_batch, total_loss

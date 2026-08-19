@@ -139,6 +139,13 @@ COSMOS_V1_2B_SAM3D_NET: LazyDict = L(MinimalV1LVGSam3DDiT)(
     action_supervision_ffn_multiplier=4,
     action_supervision_pool_grid=2,
     action_dim=14,
+    # True action-conditioned generation.  Disabled for old checkpoints and
+    # enabled explicitly by action training/inference launchers.
+    action_conditioning_enabled=False,
+    action_conditioning_hidden_dim=None,
+    action_conditioning_actions_per_latent=4,
+    action_conditioning_clip=10.0,
+    action_conditioning_scale=0.01,
     # Full-video DINO features are teacher-only by default.  Set True only to
     # reproduce legacy experiments that exposed future teacher frames as input.
     sam3d_teacher_tokens_as_condition=False,

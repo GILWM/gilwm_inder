@@ -125,6 +125,27 @@ predict2_video2world_training_2b_sam3d_full = _base_experiment(
     sam3d_dataloader,
 )
 
+# Inference must instantiate exactly the same action branch as training.
+# Passing an action H5 alone is insufficient when the selected experiment has
+# action conditioning disabled: the checkpoint's action MLP would otherwise be
+# ignored during partial loading.
+predict2_video2world_inference_2b_sam3d_action = copy.deepcopy(
+    predict2_video2world_training_2b_sam3d_full
+)
+predict2_video2world_inference_2b_sam3d_action["job"]["name"] = "2b_sam3d_action_inference"
+predict2_video2world_inference_2b_sam3d_action["model"] = dict(
+    config=dict(
+        action_loss_weight=0.0,
+        net=dict(
+            action_conditioning_enabled=True,
+            action_conditioning_hidden_dim=8192,
+            action_conditioning_actions_per_latent=4,
+            action_conditioning_clip=10.0,
+            action_conditioning_scale=0.01,
+        ),
+    )
+)
+
 smoke_dataset = copy.deepcopy(sam3d_dataset)
 smoke_dataset.sam3d_required = False
 smoke_dataset.included_batches = ["legacy4k"]
@@ -147,6 +168,7 @@ predict2_video2world_training_2b_sam3d_smoke["checkpoint"]["save_iter"] = 10
 cs = ConfigStore.instance()
 for _item in (
     predict2_video2world_training_2b_sam3d_full,
+    predict2_video2world_inference_2b_sam3d_action,
     predict2_video2world_training_2b_sam3d_smoke,
 ):
     experiment_name = [name.lower() for name, value in globals().items() if value is _item][0]

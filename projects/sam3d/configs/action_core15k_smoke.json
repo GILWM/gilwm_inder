@@ -1,0 +1,16 @@
+{
+  "name": "core15k_00000001_action_smoke",
+  "prompt": "In a fixed robotic workspace, generate a rigid, physically consistent embodied robotic arm. The arm maintains high stability with no deformation and enters the frame to Grab the green bottle with white label from the table with the right arm.",
+  "inference_type": "image2world",
+  "input_path": "/datahdd/mccxadmin/train_data/core15k_filter_75_455/core15k_00000001/first.png",
+  "action_hdf5_path": "/datahdd/mccxadmin/train_data/core15k_filter_75_455/core15k_00000001/actions.hdf5",
+  "action_norm_path": "/datahdd/mccxadmin/train_data/official1000_core15k_v93_action_norm_stats.npz",
+  "resolution": "480,640",
+  "num_output_frames": 93,
+  "num_steps": 4,
+  "enable_autoregressive": false,
+  "chunk_size": 93,
+  "chunk_overlap": 1,
+  "seed": 7,
+  "guidance": 3
+}

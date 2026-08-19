@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Cosmos-native FlowWAM-style inverse-dynamics experiment.
+# Cosmos-native action-conditioned video generation experiment.
 # The two manifests are combined in memory; videos/actions remain in place.
 
 node_rank=${1:?usage: train_action_expert_filter_75_455.sh NODE_RANK}
@@ -19,9 +19,14 @@ export COSMOS_EXTRA_BIND_PATHS=${COSMOS_EXTRA_BIND_PATHS:-/datahdd}
 # Missing SAM/SAM3D caches become zero sidecars instead of dropping samples.
 export SAM3D_REQUIRED=${SAM3D_REQUIRED:-false}
 export ACTION_NORM_PATH=${ACTION_NORM_PATH:-${data_root}/filter_75_455_v93_action_norm_stats.npz}
-export ACTION_LOSS_WEIGHT=${ACTION_LOSS_WEIGHT:-1.0}
+export ACTION_CONDITIONING_ENABLED=${ACTION_CONDITIONING_ENABLED:-true}
+export ACTION_CONDITIONING_HIDDEN_DIM=${ACTION_CONDITIONING_HIDDEN_DIM:-8192}
+export ACTION_CONDITIONING_SCALE=${ACTION_CONDITIONING_SCALE:-0.01}
+# The rectified-flow video objective directly trains the action-conditioned
+# generator. The old inverse-dynamics auxiliary loss is disabled by default.
+export ACTION_LOSS_WEIGHT=${ACTION_LOSS_WEIGHT:-0.0}
 export ACTION_ALIGNMENT_WEIGHT=${ACTION_ALIGNMENT_WEIGHT:-0.1}
-export ACTION_ARCHITECTURE=cosmos_action_expert
+export ACTION_ARCHITECTURE=${ACTION_ARCHITECTURE:-cosmos_action_expert}
 export ACTION_HIDDEN_DIM=${ACTION_HIDDEN_DIM:-512}
 export ACTION_NUM_LAYERS=${ACTION_NUM_LAYERS:-6}
 export ACTION_NUM_HEADS=${ACTION_NUM_HEADS:-8}
