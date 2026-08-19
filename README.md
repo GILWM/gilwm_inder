@@ -101,6 +101,8 @@ Python 包快照见 `projects/sam3d/configs/cosmos-musa-pip-freeze.txt`。厂商
 
 WorldArena/RoboTwin HDF5 动作 sidecar、FlowWAM 兼容性结论和动作监督训练参数见
 [WorldArena H5、FlowWAM 与动作监督接入说明](docs/worldarena_flowwam_action_integration_cn.md)。
+按 FlowWAM 思路重构、但原生适配 Cosmos 2048 维特征的多层 Action Expert 见
+[Cosmos 原生 Action Expert 设计](docs/cosmos_action_expert_cn.md)。
 
 推荐使用 `manifest.jsonl`。每行至少包含：
 

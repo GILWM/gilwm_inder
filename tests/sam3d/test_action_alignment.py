@@ -1,6 +1,9 @@
 import torch
 
-from cosmos_predict2._src.predict2.sam3d.action_alignment import TemporalActionAlignmentHead
+from cosmos_predict2._src.predict2.sam3d.action_alignment import (
+    CosmosActionExpertHead,
+    TemporalActionAlignmentHead,
+)
 
 
 def test_time_aligned_action_losses_are_finite_and_mask_invalid_samples():
@@ -32,8 +35,69 @@ def test_all_invalid_actions_return_differentiable_zero():
     assert video.grad is not None
 
 
+def test_cosmos_action_expert_reads_feature_pyramid_without_action_leakage():
+    torch.manual_seed(23)
+    head = CosmosActionExpertHead(
+        model_dim=8,
+        action_dim=14,
+        hidden_dim=8,
+        num_layers=3,
+        num_heads=2,
+        ffn_multiplier=2,
+        pool_grid=2,
+        time_embedding_dim=8,
+    )
+    features = [
+        torch.randn(2, 3 * 2 * 3, 8, requires_grad=True),
+        torch.randn(2, 3 * 2 * 3, 8, requires_grad=True),
+    ]
+    actions = torch.randn(2, 9, 14)
+    losses = head(
+        features,
+        actions,
+        latent_frames=3,
+        valid_B=torch.tensor([True, False]),
+        spatial_shape=(2, 3),
+        timesteps_B_T=torch.tensor([[0.2], [0.8]]),
+    )
+    assert losses.prediction.isfinite()
+    assert losses.alignment.isfinite()
+    (losses.prediction + losses.alignment).backward()
+    for feature in features:
+        assert torch.count_nonzero(feature.grad[0])
+        assert torch.count_nonzero(feature.grad[1]) == 0
+    # Actions are targets only; they do not require gradients or enter the
+    # expert's query construction.
+    assert actions.grad is None
+
+
+def test_cosmos_action_expert_rejects_incorrect_spatial_shape():
+    head = CosmosActionExpertHead(
+        model_dim=8,
+        hidden_dim=8,
+        num_layers=1,
+        num_heads=2,
+        ffn_multiplier=2,
+        pool_grid=1,
+        time_embedding_dim=8,
+    )
+    try:
+        head(
+            torch.randn(1, 18, 8),
+            torch.randn(1, 9, 14),
+            latent_frames=3,
+            spatial_shape=(2, 2),
+        )
+    except ValueError as error:
+        assert "spatial_shape" in str(error)
+    else:
+        raise AssertionError("Incorrect spatial shape was accepted")
+
+
 if __name__ == "__main__":
     test_time_aligned_action_losses_are_finite_and_mask_invalid_samples()
     test_latent_indices_preserve_first_and_last_action_frames()
     test_all_invalid_actions_return_differentiable_zero()
+    test_cosmos_action_expert_reads_feature_pyramid_without_action_leakage()
+    test_cosmos_action_expert_rejects_incorrect_spatial_shape()
     print("Temporal action alignment tests passed")

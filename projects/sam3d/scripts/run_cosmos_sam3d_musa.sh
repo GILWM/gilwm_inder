@@ -32,6 +32,16 @@ for bind_path in \
   fi
 done
 
+# Filtered dataset views can contain symlinks whose targets live outside the
+# manifest directory. Mount each requested root so those links also resolve
+# inside the container.
+IFS=: read -r -a extra_bind_paths <<< "${COSMOS_EXTRA_BIND_PATHS:-}"
+for bind_path in "${extra_bind_paths[@]}"; do
+  if [[ -n "${bind_path}" && -e "${bind_path}" && "${bind_path}" != "${workspace}"/* ]]; then
+    mount_args+=(-v "${bind_path}:${bind_path}")
+  fi
+done
+
 exec docker run --rm --privileged --network host --ipc host \
   "${mount_args[@]}" \
   -w "${project}" \

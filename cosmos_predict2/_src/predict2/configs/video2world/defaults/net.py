@@ -133,6 +133,11 @@ COSMOS_V1_2B_SAM3D_NET: LazyDict = L(MinimalV1LVGSam3DDiT)(
     # Optional lightweight inverse-dynamics head. Kept None for checkpoint
     # compatibility; action-supervised launches override it (typically 512).
     action_supervision_hidden_dim=None,
+    action_supervision_architecture="lightweight",
+    action_supervision_num_layers=6,
+    action_supervision_num_heads=8,
+    action_supervision_ffn_multiplier=4,
+    action_supervision_pool_grid=2,
     action_dim=14,
 )
 

@@ -20,6 +20,7 @@ SAM3D_CACHE_ROOT = "/datahdd/mccxadmin/cosmos-sam3d-cache/v1"
 
 sam3d_dataset = L(SAM3DVideoDataset)(
     dataset_dir=DATASET_ROOT,
+    manifest_paths=None,
     sam3d_cache_dir=SAM3D_CACHE_ROOT,
     sam3d_required=True,
     included_batches=["legacy4k", "core15k"],

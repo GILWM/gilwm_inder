@@ -94,8 +94,13 @@ class SAM3DVideoDataset(VideoDataset):
         self.action_alignment_offset = int(action_alignment_offset)
         self.action_validate_vector = self._parse_bool(action_validate_vector, "action_validate_vector")
         self.action_norm = ActionNormStats.load(action_norm_path) if action_norm_path else None
-        if self.action_required and self.action_hdf5_root is None:
-            raise ValueError("action_required=True requires action_hdf5_root")
+        manifest_action_overrides = self._manifest_action_overrides()
+        self.action_enabled = self.action_hdf5_root is not None or bool(manifest_action_overrides)
+        has_absolute_manifest_actions = any(os.path.isabs(path) for path in manifest_action_overrides.values())
+        if self.action_required and self.action_hdf5_root is None and not has_absolute_manifest_actions:
+            raise ValueError(
+                "action_required=True requires action_hdf5_root or explicit action paths in manifest_paths"
+            )
         if repeat_factor < 1:
             raise ValueError(f"repeat_factor must be >= 1, got {repeat_factor}")
 
@@ -132,8 +137,7 @@ class SAM3DVideoDataset(VideoDataset):
             if self.caption_paths is not None:
                 self.caption_paths = [self.caption_paths[index] for index in keep_indices]
             log.info(
-                f"Native SAM 3D index: kept {len(keep_indices)} samples from "
-                f"{len(native_samples)} indexed sidecars"
+                f"Native SAM 3D index: kept {len(keep_indices)} samples from {len(native_samples)} indexed sidecars"
             )
             if not self.video_paths:
                 raise ValueError(f"No dataset samples matched native SAM 3D index {index_path}")
@@ -147,17 +151,16 @@ class SAM3DVideoDataset(VideoDataset):
             )
 
         self.action_hdf5_paths: list[Optional[str]] = [None] * len(self.video_paths)
-        if self.action_hdf5_root is not None:
-            action_index = WorldArenaActionIndex(self.action_hdf5_root)
-            manifest_overrides = self._manifest_action_overrides()
+        if self.action_hdf5_root is not None or manifest_action_overrides:
+            action_index = WorldArenaActionIndex(self.action_hdf5_root) if self.action_hdf5_root is not None else None
             self.action_hdf5_paths = [
-                self._action_path(video_path, action_index, manifest_overrides)
+                self._action_path(video_path, action_index, manifest_action_overrides)
                 for video_path in self.video_paths
             ]
             action_count = sum(path is not None and os.path.isfile(path) for path in self.action_hdf5_paths)
             log.info(
                 f"WorldArena action sidecars: found {action_count} of "
-                f"{len(self.video_paths)} samples under {self.action_hdf5_root}"
+                f"{len(self.video_paths)} samples from explicit manifests/root {self.action_hdf5_root}"
             )
             if self.action_required:
                 keep_indices = [
@@ -209,42 +212,52 @@ class SAM3DVideoDataset(VideoDataset):
     def _manifest_action_overrides(self) -> dict[str, str]:
         """Read explicit video -> HDF5 pairs from the compact dataset manifest."""
 
-        manifest = Path(self.dataset_dir) / "manifest.jsonl"
-        if not manifest.is_file():
-            return {}
         result: dict[str, str] = {}
-        for line_number, line in enumerate(manifest.read_text(encoding="utf-8").splitlines(), 1):
-            if not line.strip():
+        manifests = getattr(self, "manifest_paths", None) or [Path(self.dataset_dir) / "manifest.jsonl"]
+        explicit_manifests = bool(getattr(self, "_explicit_manifest_paths", False))
+        for manifest_value in manifests:
+            manifest = Path(manifest_value)
+            if not manifest.is_file():
                 continue
-            record = json.loads(line)
-            video = record.get("video")
-            action = next(
-                (
-                    record.get(key)
-                    for key in ("trajectory_hdf5", "action_hdf5", "hdf5", "actions")
-                    if record.get(key)
-                ),
-                None,
-            )
-            if action is None:
-                continue
-            if not isinstance(video, str) or not isinstance(action, str):
-                raise ValueError(f"{manifest}:{line_number}: invalid video/action path fields")
-            result[os.path.normpath(os.path.join(self.dataset_dir, video))] = action
+            for line_number, line in enumerate(manifest.read_text(encoding="utf-8").splitlines(), 1):
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                video = record.get("video")
+                action = next(
+                    (
+                        record.get(key)
+                        for key in ("trajectory_hdf5", "action_hdf5", "hdf5", "actions")
+                        if record.get(key)
+                    ),
+                    None,
+                )
+                if action is None:
+                    continue
+                if not isinstance(video, str) or not isinstance(action, str):
+                    raise ValueError(f"{manifest}:{line_number}: invalid video/action path fields")
+                video_path = os.path.normpath(os.path.join(manifest.parent, video))
+                if explicit_manifests and not os.path.isabs(action):
+                    action = os.path.normpath(os.path.join(manifest.parent, action))
+                result[video_path] = action
         return result
 
     def _action_path(
         self,
         video_path: str,
-        action_index: WorldArenaActionIndex,
+        action_index: Optional[WorldArenaActionIndex],
         manifest_overrides: dict[str, str],
     ) -> Optional[str]:
         override = manifest_overrides.get(os.path.normpath(video_path))
         if override is not None:
             candidate = Path(override)
             if not candidate.is_absolute():
+                if self.action_hdf5_root is None:
+                    return None
                 candidate = Path(self.action_hdf5_root) / candidate
-            return str(candidate.resolve())
+            return os.path.abspath(candidate)
+        if action_index is None:
+            return None
         resolved = action_index.resolve(video_path, dataset_root=self.dataset_dir)
         return str(resolved) if resolved is not None else None
 
@@ -324,17 +337,13 @@ class SAM3DVideoDataset(VideoDataset):
         if (input_h, input_w) == (target_h, target_w):
             return value
 
-        y = ((torch.arange(target_h, dtype=torch.float32) + 0.5) * input_h / target_h - 0.5).clamp(
-            0, input_h - 1
-        )
+        y = ((torch.arange(target_h, dtype=torch.float32) + 0.5) * input_h / target_h - 0.5).clamp(0, input_h - 1)
         y0 = y.floor().long()
         y1 = (y0 + 1).clamp(max=input_h - 1)
         wy = (y - y0).to(dtype=value.dtype).view(1, target_h, 1)
         resized_h = value.index_select(-2, y0) * (1 - wy) + value.index_select(-2, y1) * wy
 
-        x = ((torch.arange(target_w, dtype=torch.float32) + 0.5) * input_w / target_w - 0.5).clamp(
-            0, input_w - 1
-        )
+        x = ((torch.arange(target_w, dtype=torch.float32) + 0.5) * input_w / target_w - 0.5).clamp(0, input_w - 1)
         x0 = x.floor().long()
         x1 = (x0 + 1).clamp(max=input_w - 1)
         wx = (x - x0).to(dtype=value.dtype).view(1, 1, target_w)
@@ -345,12 +354,8 @@ class SAM3DVideoDataset(VideoDataset):
             "sam3d_tokens_B_F_N_D": torch.zeros(
                 self.sam3d_teacher_frames, self.sam3d_num_tokens, self.sam3d_token_dim, dtype=torch.float32
             ),
-            "sam_mask_B_K_H_W": torch.zeros(
-                self.sam_mask_instances, *self.sam_mask_size, dtype=torch.float32
-            ),
-            "sam_mask_meta_B_K_D": torch.zeros(
-                self.sam_mask_instances, self.sam_mask_meta_dim, dtype=torch.float32
-            ),
+            "sam_mask_B_K_H_W": torch.zeros(self.sam_mask_instances, *self.sam_mask_size, dtype=torch.float32),
+            "sam_mask_meta_B_K_D": torch.zeros(self.sam_mask_instances, self.sam_mask_meta_dim, dtype=torch.float32),
             "sam3d_geometry_B_C_H_W": torch.zeros(
                 self.sam3d_geometry_channels, *self.sam3d_geometry_size, dtype=torch.float32
             ),
@@ -381,9 +386,7 @@ class SAM3DVideoDataset(VideoDataset):
         if tokens.ndim == 2:
             tokens = tokens.unsqueeze(0)
         if tokens.ndim != 3 or tokens.shape[-1] != self.sam3d_token_dim:
-            raise ValueError(
-                f"sam3d_tokens in {path} must be [F,N,{self.sam3d_token_dim}], got {tuple(tokens.shape)}"
-            )
+            raise ValueError(f"sam3d_tokens in {path} must be [F,N,{self.sam3d_token_dim}], got {tuple(tokens.shape)}")
         tokens = self._select_or_pad_axis(tokens, self.sam3d_teacher_frames, axis=0)
         tokens = self._select_or_pad_axis(tokens, self.sam3d_num_tokens, axis=1)
 
@@ -416,8 +419,7 @@ class SAM3DVideoDataset(VideoDataset):
             shape_latents = shape_latents.unsqueeze(0)
         if shape_latents.ndim != 3 or shape_latents.shape[-1] != self.sam3d_shape_dim:
             raise ValueError(
-                f"sam3d_shape_latents in {path} must be [K,N,{self.sam3d_shape_dim}], "
-                f"got {tuple(shape_latents.shape)}"
+                f"sam3d_shape_latents in {path} must be [K,N,{self.sam3d_shape_dim}], got {tuple(shape_latents.shape)}"
             )
         shape_latents = self._select_or_pad_axis(shape_latents, self.sam3d_shape_instances, axis=0)
         shape_latents = self._select_or_pad_axis(shape_latents, self.sam3d_shape_tokens, axis=1)
@@ -470,7 +472,7 @@ class SAM3DVideoDataset(VideoDataset):
             data["num_frames"] = self.sequence_length
             data["padding_mask"] = torch.zeros(1, height, width)
             data.update(self._load_condition(index))
-            if self.action_hdf5_root is not None:
+            if self.action_enabled:
                 actions, action_valid = self._load_actions(index, video_frame_indices, video_frame_count)
                 data["actions_B_T_D"] = actions
                 data["action_valid_B"] = action_valid

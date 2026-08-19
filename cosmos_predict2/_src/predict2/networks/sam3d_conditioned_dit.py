@@ -21,7 +21,10 @@ import torch.nn.functional as F
 
 from cosmos_predict2._src.predict2.conditioner import DataType
 from cosmos_predict2._src.predict2.networks.minimal_v1_lvg_dit import MinimalV1LVGDiT
-from cosmos_predict2._src.predict2.sam3d.action_alignment import TemporalActionAlignmentHead
+from cosmos_predict2._src.predict2.sam3d.action_alignment import (
+    CosmosActionExpertHead,
+    TemporalActionAlignmentHead,
+)
 
 
 class SpatialConditionTokenizer(nn.Module):
@@ -90,6 +93,11 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
         sam3d_repa_projection_dim: Optional[int] = None,
         sam3d_teacher_tokens_as_condition: bool = False,
         action_supervision_hidden_dim: Optional[int] = None,
+        action_supervision_architecture: str = "lightweight",
+        action_supervision_num_layers: int = 6,
+        action_supervision_num_heads: int = 8,
+        action_supervision_ffn_multiplier: int = 4,
+        action_supervision_pool_grid: int = 2,
         action_dim: int = 14,
         **kwargs,
     ):
@@ -139,15 +147,30 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
         # Kept structurally optional so all existing SAM3D checkpoints remain
         # loadable without missing action-head parameters. Training launchers
         # enable it only when action supervision has a non-zero weight.
-        self.action_supervision_head = (
-            TemporalActionAlignmentHead(
+        if action_supervision_architecture not in {"lightweight", "cosmos_action_expert"}:
+            raise ValueError(
+                "action_supervision_architecture must be lightweight or cosmos_action_expert, "
+                f"got {action_supervision_architecture!r}"
+            )
+        self.action_supervision_architecture = action_supervision_architecture
+        if action_supervision_hidden_dim is None:
+            self.action_supervision_head = None
+        elif action_supervision_architecture == "lightweight":
+            self.action_supervision_head = TemporalActionAlignmentHead(
                 model_dim=model_channels,
                 action_dim=int(action_dim),
                 hidden_dim=int(action_supervision_hidden_dim),
             )
-            if action_supervision_hidden_dim is not None
-            else None
-        )
+        else:
+            self.action_supervision_head = CosmosActionExpertHead(
+                model_dim=model_channels,
+                action_dim=int(action_dim),
+                hidden_dim=int(action_supervision_hidden_dim),
+                num_layers=int(action_supervision_num_layers),
+                num_heads=int(action_supervision_num_heads),
+                ffn_multiplier=int(action_supervision_ffn_multiplier),
+                pool_grid=int(action_supervision_pool_grid),
+            )
 
         # Modality identity is retained after concatenation.  One zero gate per
         # block follows the PAIWorld-style residual-adapter design and is kept
@@ -239,7 +262,11 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
 
         if self.sam3d_teacher_tokens_as_condition and sam3d_tokens_B_F_N_D is not None:
             tokens = self._flatten_teacher_frames(sam3d_tokens_B_F_N_D)
-            append(self._project_modality(tokens, self.sam3d_token_projector, 0, self.sam_condition_modality_tokens[0], output_dtype))
+            append(
+                self._project_modality(
+                    tokens, self.sam3d_token_projector, 0, self.sam_condition_modality_tokens[0], output_dtype
+                )
+            )
         if sam_mask_B_K_H_W is not None:
             active = sam_mask_B_K_H_W.detach().float().abs().amax(dim=(1, 2, 3)) > 0
             append(
@@ -253,7 +280,15 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
                 )
             )
         if sam_mask_meta_B_K_D is not None:
-            append(self._project_modality(sam_mask_meta_B_K_D, self.sam_mask_meta_projector, 2, self.sam_condition_modality_tokens[2], output_dtype))
+            append(
+                self._project_modality(
+                    sam_mask_meta_B_K_D,
+                    self.sam_mask_meta_projector,
+                    2,
+                    self.sam_condition_modality_tokens[2],
+                    output_dtype,
+                )
+            )
         if sam3d_geometry_B_C_H_W is not None:
             active = sam3d_geometry_B_C_H_W.detach().float().abs().amax(dim=(1, 2, 3)) > 0
             append(
@@ -269,8 +304,7 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
         if sam3d_shape_latents_B_K_N_D is not None:
             if sam3d_shape_latents_B_K_N_D.ndim != 4:
                 raise ValueError(
-                    "SAM 3D shape latents must be [B,K,N,D], got "
-                    f"{tuple(sam3d_shape_latents_B_K_N_D.shape)}"
+                    f"SAM 3D shape latents must be [B,K,N,D], got {tuple(sam3d_shape_latents_B_K_N_D.shape)}"
                 )
             append(
                 self._project_modality(
@@ -282,7 +316,15 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
                 )
             )
         if sam3d_object_pose_B_K_D is not None:
-            append(self._project_modality(sam3d_object_pose_B_K_D, self.sam3d_pose_projector, 5, self.sam_condition_modality_tokens[5], output_dtype))
+            append(
+                self._project_modality(
+                    sam3d_object_pose_B_K_D,
+                    self.sam3d_pose_projector,
+                    5,
+                    self.sam_condition_modality_tokens[5],
+                    output_dtype,
+                )
+            )
 
         if not contexts:
             return None
@@ -291,9 +333,7 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
             raise ValueError(f"SAM condition batch sizes do not match: {sorted(batch_sizes)}")
         context = torch.cat(contexts, dim=1)
         if context.shape[1] > self.sam_condition_max_tokens:
-            context = F.adaptive_avg_pool1d(
-                context.transpose(1, 2), self.sam_condition_max_tokens
-            ).transpose(1, 2)
+            context = F.adaptive_avg_pool1d(context.transpose(1, 2), self.sam_condition_max_tokens).transpose(1, 2)
         return context.contiguous()
 
     def forward(

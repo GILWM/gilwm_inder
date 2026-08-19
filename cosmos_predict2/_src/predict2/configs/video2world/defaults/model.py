@@ -93,6 +93,7 @@ FSDP_SAM3D_RECTIFIED_FLOW_CONFIG = dict(
             action_loss_weight=0.0,
             action_alignment_weight=0.1,
             action_feature_layer=7,
+            action_feature_layers=(),
         ),
         _recursive_=False,
     ),

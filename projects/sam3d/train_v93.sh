@@ -6,7 +6,7 @@ repo_root=${COSMOS_PROJECT:-$(git rev-parse --show-toplevel)}
 workspace=${COSMOS_SAM3D_WORKSPACE:?set COSMOS_SAM3D_WORKSPACE}
 dataset_root=${SAM3D_DATASET_ROOT:?set SAM3D_DATASET_ROOT}
 cache_root=${SAM3D_CACHE_ROOT:?set SAM3D_CACHE_ROOT}
-objects_root=${SAM3D_OBJECTS_ROOT:?set SAM3D_OBJECTS_ROOT}
+objects_root=${SAM3D_OBJECTS_ROOT:-}
 base_checkpoint=${SAM3D_BASE_CHECKPOINT:?set SAM3D_BASE_CHECKPOINT}
 
 nnodes=${NNODES:-4}
@@ -25,16 +25,42 @@ repa_projection_dim=${SAM3D_REPA_PROJECTION_DIM:-768}
 action_loss_weight=${ACTION_LOSS_WEIGHT:-0}
 action_alignment_weight=${ACTION_ALIGNMENT_WEIGHT:-0.1}
 action_feature_layer=${ACTION_FEATURE_LAYER:-7}
+action_feature_layers=${ACTION_FEATURE_LAYERS:-}
 action_hidden_dim=${ACTION_HIDDEN_DIM:-512}
+action_architecture=${ACTION_ARCHITECTURE:-lightweight}
+action_num_layers=${ACTION_NUM_LAYERS:-6}
+action_num_heads=${ACTION_NUM_HEADS:-8}
+action_ffn_multiplier=${ACTION_FFN_MULTIPLIER:-4}
+action_pool_grid=${ACTION_POOL_GRID:-2}
 action_alignment_offset=${ACTION_ALIGNMENT_OFFSET:-0}
+manifest_paths=${DATASET_MANIFEST_PATHS:-}
+included_batches=${INCLUDED_BATCHES:-"['legacy4k','core15k']"}
+sam3d_required=${SAM3D_REQUIRED:-true}
+num_frames=${NUM_FRAMES:-93}
 scheduler_cycle=${SCHEDULER_CYCLE_LENGTH:-5000}
 scheduler_warmup=${SCHEDULER_WARMUP_STEPS:-500}
 
 test -d "${repo_root}"
 test -d "${dataset_root}"
 test -d "${cache_root}"
-test -d "${objects_root}"
+if [[ -n "${objects_root}" ]]; then test -d "${objects_root}"; fi
 test -d "${base_checkpoint}"
+
+manifest_overrides=()
+if [[ -n "${manifest_paths}" ]]; then
+  manifest_overrides=(
+    "dataloader_train.dataset.manifest_paths=${manifest_paths}"
+    "dataloader_train.sampler.dataset.manifest_paths=${manifest_paths}"
+  )
+fi
+
+object_overrides=()
+if [[ -n "${objects_root}" ]]; then
+  object_overrides=(
+    "dataloader_train.dataset.sam3d_objects_root=${objects_root}"
+    "dataloader_train.sampler.dataset.sam3d_objects_root=${objects_root}"
+  )
+fi
 
 repa_projection_overrides=()
 if [[ ! "${repa_weight}" =~ ^0+([.]0+)?$ ]]; then
@@ -43,13 +69,15 @@ fi
 
 action_overrides=()
 if [[ ! "${action_loss_weight}" =~ ^0+([.]0+)?$ ]]; then
-  action_hdf5_root=${ACTION_HDF5_ROOT:?set ACTION_HDF5_ROOT when ACTION_LOSS_WEIGHT is non-zero}
+  action_hdf5_root=${ACTION_HDF5_ROOT:-}
   action_norm_path=${ACTION_NORM_PATH:?set ACTION_NORM_PATH when ACTION_LOSS_WEIGHT is non-zero}
-  test -d "${action_hdf5_root}"
+  if [[ -z "${action_hdf5_root}" && -z "${manifest_paths}" ]]; then
+    echo "set ACTION_HDF5_ROOT or DATASET_MANIFEST_PATHS when ACTION_LOSS_WEIGHT is non-zero" >&2
+    exit 2
+  fi
+  if [[ -n "${action_hdf5_root}" ]]; then test -d "${action_hdf5_root}"; fi
   test -s "${action_norm_path}"
   action_overrides=(
-    "dataloader_train.dataset.action_hdf5_root=${action_hdf5_root}"
-    "dataloader_train.sampler.dataset.action_hdf5_root=${action_hdf5_root}"
     "dataloader_train.dataset.action_required=True"
     "dataloader_train.sampler.dataset.action_required=True"
     "dataloader_train.dataset.action_norm_path=${action_norm_path}"
@@ -57,7 +85,21 @@ if [[ ! "${action_loss_weight}" =~ ^0+([.]0+)?$ ]]; then
     "dataloader_train.dataset.action_alignment_offset=${action_alignment_offset}"
     "dataloader_train.sampler.dataset.action_alignment_offset=${action_alignment_offset}"
     "model.config.net.action_supervision_hidden_dim=${action_hidden_dim}"
+    "model.config.net.action_supervision_architecture=${action_architecture}"
+    "model.config.net.action_supervision_num_layers=${action_num_layers}"
+    "model.config.net.action_supervision_num_heads=${action_num_heads}"
+    "model.config.net.action_supervision_ffn_multiplier=${action_ffn_multiplier}"
+    "model.config.net.action_supervision_pool_grid=${action_pool_grid}"
   )
+  if [[ -n "${action_hdf5_root}" ]]; then
+    action_overrides+=(
+      "dataloader_train.dataset.action_hdf5_root=${action_hdf5_root}"
+      "dataloader_train.sampler.dataset.action_hdf5_root=${action_hdf5_root}"
+    )
+  fi
+  if [[ -n "${action_feature_layers}" ]]; then
+    action_overrides+=("model.config.action_feature_layers=${action_feature_layers}")
+  fi
 fi
 
 export COSMOS_PROJECT="${repo_root}"
@@ -80,16 +122,16 @@ exec "${repo_root}/projects/sam3d/scripts/run_cosmos_sam3d_musa.sh" \
   experiment=predict2_video2world_training_2b_sam3d_full \
   dataloader_train.dataset.dataset_dir="${dataset_root}" \
   dataloader_train.sampler.dataset.dataset_dir="${dataset_root}" \
+  "${manifest_overrides[@]}" \
   dataloader_train.dataset.sam3d_cache_dir="${cache_root}" \
   dataloader_train.sampler.dataset.sam3d_cache_dir="${cache_root}" \
-  dataloader_train.dataset.sam3d_required=True \
-  dataloader_train.sampler.dataset.sam3d_required=True \
-  dataloader_train.dataset.sam3d_objects_root="${objects_root}" \
-  dataloader_train.sampler.dataset.sam3d_objects_root="${objects_root}" \
-  dataloader_train.dataset.included_batches="['legacy4k','core15k']" \
-  dataloader_train.sampler.dataset.included_batches="['legacy4k','core15k']" \
-  dataloader_train.dataset.num_frames=93 \
-  dataloader_train.sampler.dataset.num_frames=93 \
+  dataloader_train.dataset.sam3d_required="${sam3d_required}" \
+  dataloader_train.sampler.dataset.sam3d_required="${sam3d_required}" \
+  "${object_overrides[@]}" \
+  dataloader_train.dataset.included_batches="${included_batches}" \
+  dataloader_train.sampler.dataset.included_batches="${included_batches}" \
+  dataloader_train.dataset.num_frames="${num_frames}" \
+  dataloader_train.sampler.dataset.num_frames="${num_frames}" \
   dataloader_train.dataset.sampling_mode=uniform \
   dataloader_train.sampler.dataset.sampling_mode=uniform \
   dataloader_train.dataset.filter_short_videos=True \
