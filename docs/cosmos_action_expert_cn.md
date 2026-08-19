@@ -116,6 +116,11 @@ projects/sam3d/train_action_expert_core15k_1k.sh NODE_RANK
 ```
 
 默认使用 4 节点、每节点 8 卡、每卡 batch size 4，并在 500/1000 iter 保存。
+启动器会根据 `ens11np0` 在每个节点自动解析对应的 RDMA HCA。当前集群中
+wx25 对应 `mlx5_0`，wx26-wx28 对应 `mlx5_2`，不能在四台机器上统一写死为
+同一个 `MCCL_IB_HCA`。`projects/sam3d/scripts/smoke_mccl_distributed.py`
+可在正式训练前验证多机 broadcast、all-reduce 和 barrier。
+
 动作归一化统计固定来自官方 WorldArena 1000 题，加上本次真正可训练的
 12,850 条 Core15K（`>=93` 帧）样本。Robotwin2 不参加这次训练，也不参与
 这份 normalization 统计。
