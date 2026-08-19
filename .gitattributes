@@ -1,6 +1,10 @@
 *.lock linguist-generated=true gitlab-generated
 tests/data/** linguist-generated=true gitlab-generated
 
+# Training launchers must remain directly executable after a Windows checkout
+# is archived and deployed to Linux workers.
+*.sh text eol=lf
+
 assets/** filter=lfs diff=lfs merge=lfs -text
 
 # Video files
