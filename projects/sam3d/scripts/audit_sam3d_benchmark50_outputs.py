@@ -25,6 +25,7 @@ def main() -> None:
     invalid: list[str] = []
     for row in rows:
         path = args.videos / f"{row['name']}.mp4"
+        expected_frames = int(row.get("num_output_frames", 121))
         if not path.is_file() or path.stat().st_size == 0:
             missing.append(path.name)
             continue
@@ -37,9 +38,10 @@ def main() -> None:
         frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = float(video.get(cv2.CAP_PROP_FPS))
         video.release()
-        if (width, height, frames) != (640, 480, 121) or abs(fps - 24.0) > 0.01:
+        if (width, height, frames) != (640, 480, expected_frames) or abs(fps - 24.0) > 0.01:
             invalid.append(
-                f"{path.name}: width={width} height={height} frames={frames} fps={fps:g}"
+                f"{path.name}: width={width} height={height} frames={frames} "
+                f"expected_frames={expected_frames} fps={fps:g}"
             )
 
     print(f"EXPECTED={len(rows)}")
