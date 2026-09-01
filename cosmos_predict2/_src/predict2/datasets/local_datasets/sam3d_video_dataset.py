@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Video dataset that attaches fixed-shape SAM 3 / SAM 3D cache tensors."""
+"""Video dataset that attaches SAM 3 masks and native SAM 3D conditions."""
 
 from __future__ import annotations
 
@@ -17,16 +17,18 @@ from cosmos_predict2._src.imaginaire.utils import log
 from cosmos_predict2._src.predict2.datasets.local_datasets.dataset_video import VideoDataset
 
 
+_LOGGED_ELIGIBILITY_SUMMARIES: set[tuple[str, str, str]] = set()
+
+
 class SAM3DVideoDataset(VideoDataset):
-    """Load ordinary Cosmos samples plus offline frozen-teacher features.
+    """Load ordinary Cosmos samples plus offline SAM 3 / SAM 3D conditions.
 
     Cache layout mirrors the compact training-data layout::
 
         CACHE_ROOT/<batch>/<question_id>/condition.pt
 
-    Each cache contains ``sam3d_tokens``, ``sam_masks``, ``sam_mask_meta``
-    and ``sam3d_geometry``.  Shapes are normalized here so the default
-    DataLoader collate function remains deterministic.
+    Teacher tokens are optional and disabled by default. Shapes are normalized
+    here so the default DataLoader collate function remains deterministic.
     """
 
     def __init__(
@@ -34,6 +36,7 @@ class SAM3DVideoDataset(VideoDataset):
         *args,
         sam3d_cache_dir: str,
         sam3d_required: bool = True,
+        sam3d_load_teacher_tokens: bool = False,
         sam3d_teacher_frames: int = 8,
         sam3d_num_tokens: int = 256,
         sam3d_token_dim: int = 768,
@@ -49,11 +52,13 @@ class SAM3DVideoDataset(VideoDataset):
         repeat_factor: int = 1,
         sam3d_native_index: Optional[str] = None,
         sam3d_objects_root: Optional[str] = None,
+        sam3d_require_complete_conditions: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.sam3d_cache_dir = sam3d_cache_dir
         self.sam3d_required = sam3d_required
+        self.sam3d_load_teacher_tokens = sam3d_load_teacher_tokens
         self.sam3d_teacher_frames = sam3d_teacher_frames
         self.sam3d_num_tokens = sam3d_num_tokens
         self.sam3d_token_dim = sam3d_token_dim
@@ -67,23 +72,37 @@ class SAM3DVideoDataset(VideoDataset):
         self.sam3d_shape_dim = sam3d_shape_dim
         self.sam3d_pose_dim = sam3d_pose_dim
         self.sam3d_objects_root = sam3d_objects_root
+        self.sam3d_require_complete_conditions = sam3d_require_complete_conditions
         if repeat_factor < 1:
             raise ValueError(f"repeat_factor must be >= 1, got {repeat_factor}")
+        if self.sam3d_require_complete_conditions:
+            if not self.sam3d_required:
+                raise ValueError("sam3d_require_complete_conditions=True requires sam3d_required=True")
+            if sam3d_native_index is None:
+                raise ValueError(
+                    "sam3d_require_complete_conditions=True requires a validated sam3d_native_index"
+                )
+            if self.sam3d_objects_root is None:
+                raise ValueError(
+                    "sam3d_require_complete_conditions=True requires sam3d_objects_root"
+                )
 
+        candidate_count = len(self.video_paths)
+        missing_cache_count = 0
         self.sam3d_condition_paths = [self._condition_path(video_path) for video_path in self.video_paths]
         if self.sam3d_required:
             keep_indices = [index for index, path in enumerate(self.sam3d_condition_paths) if os.path.isfile(path)]
-            missing_count = len(self.video_paths) - len(keep_indices)
-            self.video_paths = [self.video_paths[index] for index in keep_indices]
-            self.sam3d_condition_paths = [self.sam3d_condition_paths[index] for index in keep_indices]
-            if self.caption_paths is not None:
-                self.caption_paths = [self.caption_paths[index] for index in keep_indices]
+            missing_cache_count = len(self.video_paths) - len(keep_indices)
+            self._keep_samples(keep_indices)
             log.info(
-                f"SAM 3D cache coverage: kept {len(keep_indices)} samples and excluded {missing_count} missing caches"
+                f"SAM 3D cache coverage: kept {len(keep_indices)} samples and "
+                f"excluded {missing_cache_count} missing caches"
             )
             if not self.video_paths:
                 raise ValueError(f"No SAM 3D caches found under {self.sam3d_cache_dir}")
 
+        not_in_native_index_count = 0
+        native_sample_count = 0
         if sam3d_native_index is not None:
             index_path = Path(sam3d_native_index)
             if not index_path.is_file():
@@ -93,15 +112,14 @@ class SAM3DVideoDataset(VideoDataset):
                 for line in index_path.read_text(encoding="utf-8").splitlines()
                 if line.strip()
             }
+            native_sample_count = len(native_samples)
             keep_indices = []
             for index, condition_path in enumerate(self.sam3d_condition_paths):
                 sample = os.path.relpath(os.path.dirname(condition_path), self.sam3d_cache_dir).replace("\\", "/")
                 if sample in native_samples:
                     keep_indices.append(index)
-            self.video_paths = [self.video_paths[index] for index in keep_indices]
-            self.sam3d_condition_paths = [self.sam3d_condition_paths[index] for index in keep_indices]
-            if self.caption_paths is not None:
-                self.caption_paths = [self.caption_paths[index] for index in keep_indices]
+            not_in_native_index_count = len(self.video_paths) - len(keep_indices)
+            self._keep_samples(keep_indices)
             log.info(
                 f"Native SAM 3D index: kept {len(keep_indices)} samples from "
                 f"{len(native_samples)} indexed sidecars"
@@ -110,12 +128,47 @@ class SAM3DVideoDataset(VideoDataset):
                 raise ValueError(f"No dataset samples matched native SAM 3D index {index_path}")
 
         self.sam3d_object_paths = [self._object_path(path) for path in self.sam3d_condition_paths]
+        missing_sidecar_count = 0
+        if self.sam3d_require_complete_conditions:
+            keep_indices = [
+                index
+                for index, path in enumerate(self.sam3d_object_paths)
+                if path is not None and os.path.isfile(path)
+            ]
+            missing_sidecar_count = len(self.video_paths) - len(keep_indices)
+            self._keep_samples(keep_indices, include_object_paths=True)
+            if not self.video_paths:
+                raise ValueError(
+                    "No samples have complete SAM 3 / SAM 3D conditions after applying "
+                    f"{sam3d_native_index}"
+                )
+
         if self.sam3d_objects_root is not None:
             native_count = sum(os.path.isfile(path) for path in self.sam3d_object_paths)
             log.info(
                 f"Native SAM 3D sidecar overlay: found {native_count} of "
                 f"{len(self.sam3d_object_paths)} dataset samples under {self.sam3d_objects_root}"
             )
+
+        if self.sam3d_require_complete_conditions:
+            summary_key = (
+                os.path.realpath(self.dataset_dir),
+                os.path.realpath(self.sam3d_cache_dir),
+                os.path.realpath(str(sam3d_native_index)),
+            )
+            if summary_key not in _LOGGED_ELIGIBILITY_SUMMARIES:
+                _LOGGED_ELIGIBILITY_SUMMARIES.add(summary_key)
+                filtered_count = candidate_count - len(self.video_paths)
+                log.info(
+                    "SAM3D_TRAINING_ELIGIBILITY "
+                    f"candidates_after_video_filters={candidate_count} "
+                    f"eligible_complete={len(self.video_paths)} filtered_total={filtered_count} "
+                    f"missing_base_cache={missing_cache_count} "
+                    f"not_in_validated_index={not_in_native_index_count} "
+                    f"missing_sidecar={missing_sidecar_count} "
+                    f"validated_index_entries={native_sample_count} teacher_tokens_required=false",
+                    rank0_only=True,
+                )
 
         # Small-scale memory/stability tests deliberately use a handful of
         # fully native sidecars.  Logical repetition supplies enough local
@@ -128,6 +181,16 @@ class SAM3DVideoDataset(VideoDataset):
             if self.caption_paths is not None:
                 self.caption_paths = self.caption_paths * repeat_factor
             log.info(f"Repeated SAM 3D dataset {repeat_factor}x for {len(self.video_paths)} logical samples")
+
+    def _keep_samples(self, keep_indices: list[int], include_object_paths: bool = False) -> None:
+        """Apply one eligibility filter to all parallel sample-path lists."""
+
+        self.video_paths = [self.video_paths[index] for index in keep_indices]
+        self.sam3d_condition_paths = [self.sam3d_condition_paths[index] for index in keep_indices]
+        if self.caption_paths is not None:
+            self.caption_paths = [self.caption_paths[index] for index in keep_indices]
+        if include_object_paths:
+            self.sam3d_object_paths = [self.sam3d_object_paths[index] for index in keep_indices]
 
     def _condition_path(self, video_path: str) -> str:
         relative_video_path = os.path.relpath(video_path, self.dataset_dir)
@@ -207,9 +270,9 @@ class SAM3DVideoDataset(VideoDataset):
 
     def _empty_condition(self) -> dict[str, torch.Tensor]:
         return {
-            "sam3d_tokens_B_F_N_D": torch.zeros(
-                self.sam3d_teacher_frames, self.sam3d_num_tokens, self.sam3d_token_dim, dtype=torch.float32
-            ),
+            # Keep a tiny sentinel so the existing conditioner schema remains
+            # compatible without allocating or transferring teacher features.
+            "sam3d_tokens_B_F_N_D": torch.zeros(1, 1, self.sam3d_token_dim, dtype=torch.float32),
             "sam_mask_B_K_H_W": torch.zeros(
                 self.sam_mask_instances, *self.sam_mask_size, dtype=torch.float32
             ),
@@ -236,21 +299,31 @@ class SAM3DVideoDataset(VideoDataset):
 
         cache = self._load_tensor_cache(path)
         object_path = self.sam3d_object_paths[index]
+        if self.sam3d_require_complete_conditions and (object_path is None or not os.path.isfile(object_path)):
+            raise FileNotFoundError(f"Required SAM 3D object sidecar disappeared after filtering: {object_path}")
         if object_path is not None and os.path.isfile(object_path):
             native = self._load_tensor_cache(object_path)
             cache = dict(cache)
-            cache["sam3d_geometry"] = native["sam3d_geometry"]
-            cache["sam3d_shape_latents"] = native["sam3d_shape_latents"]
-            cache["sam3d_object_pose"] = native["sam3d_object_pose"]
-        tokens = torch.as_tensor(cache["sam3d_tokens"], dtype=torch.float32)
-        if tokens.ndim == 2:
-            tokens = tokens.unsqueeze(0)
-        if tokens.ndim != 3 or tokens.shape[-1] != self.sam3d_token_dim:
-            raise ValueError(
-                f"sam3d_tokens in {path} must be [F,N,{self.sam3d_token_dim}], got {tuple(tokens.shape)}"
-            )
-        tokens = self._select_or_pad_axis(tokens, self.sam3d_teacher_frames, axis=0)
-        tokens = self._select_or_pad_axis(tokens, self.sam3d_num_tokens, axis=1)
+            for key in ("sam3d_geometry", "sam3d_shape_latents", "sam3d_object_pose"):
+                if self.sam3d_require_complete_conditions and key not in native:
+                    raise KeyError(f"Required {key} is missing from {object_path}")
+                cache[key] = native[key]
+        if self.sam3d_require_complete_conditions:
+            for key in ("sam_masks", "sam_mask_meta", "sam3d_geometry", "sam3d_shape_latents", "sam3d_object_pose"):
+                if key not in cache:
+                    raise KeyError(f"Required {key} is missing from {path}")
+        if self.sam3d_load_teacher_tokens:
+            tokens = torch.as_tensor(cache["sam3d_tokens"], dtype=torch.float32)
+            if tokens.ndim == 2:
+                tokens = tokens.unsqueeze(0)
+            if tokens.ndim != 3 or tokens.shape[-1] != self.sam3d_token_dim:
+                raise ValueError(
+                    f"sam3d_tokens in {path} must be [F,N,{self.sam3d_token_dim}], got {tuple(tokens.shape)}"
+                )
+            tokens = self._select_or_pad_axis(tokens, self.sam3d_teacher_frames, axis=0)
+            tokens = self._select_or_pad_axis(tokens, self.sam3d_num_tokens, axis=1)
+        else:
+            tokens = torch.zeros(1, 1, self.sam3d_token_dim, dtype=torch.float32)
 
         masks = torch.as_tensor(cache["sam_masks"], dtype=torch.float32)
         if masks.ndim == 2:

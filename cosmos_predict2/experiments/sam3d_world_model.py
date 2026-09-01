@@ -22,6 +22,10 @@ sam3d_dataset = L(SAM3DVideoDataset)(
     dataset_dir=DATASET_ROOT,
     sam3d_cache_dir=SAM3D_CACHE_ROOT,
     sam3d_required=True,
+    # Formal training must use the atomically generated, deeply validated
+    # allowlist. Teacher/DINO tokens are deliberately not part of eligibility.
+    sam3d_require_complete_conditions=True,
+    sam3d_load_teacher_tokens=False,
     included_batches=["legacy4k", "core15k"],
     num_frames=121,
     video_size=(480, 640),
@@ -119,6 +123,7 @@ predict2_video2world_training_2b_sam3d_full = _base_experiment(
 
 smoke_dataset = copy.deepcopy(sam3d_dataset)
 smoke_dataset.sam3d_required = False
+smoke_dataset.sam3d_require_complete_conditions = False
 smoke_dataset.included_batches = ["legacy4k"]
 smoke_dataloader = copy.deepcopy(sam3d_dataloader)
 smoke_dataloader.dataset = smoke_dataset

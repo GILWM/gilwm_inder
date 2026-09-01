@@ -111,6 +111,13 @@ def load_sam3d_condition_cache(path: str) -> dict[str, torch.Tensor]:
     shapes: dict[str, tuple[int, ...]] = {}
     for source_key, (target_key, expected_ndim) in _SAM3D_CACHE_FIELDS.items():
         value = cache.get(source_key, cache.get(target_key))
+        if source_key == "sam3d_tokens" and value is None:
+            # No-RePA inference intentionally omits teacher features. Keep a
+            # tiny compatibility sentinel; the network ignores it when
+            # sam3d_teacher_tokens_as_condition is false.
+            output[target_key] = torch.zeros(1, 1, 1, 768, dtype=torch.float32)
+            shapes[source_key] = tuple(output[target_key].shape)
+            continue
         if value is None:
             raise KeyError(f"SAM 3D condition cache is missing {source_key!r}: {path}")
         tensor = torch.as_tensor(value, dtype=torch.float32)

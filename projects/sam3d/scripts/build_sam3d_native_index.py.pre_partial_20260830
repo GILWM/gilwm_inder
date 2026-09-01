@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import tempfile
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+import torch
+
+
+def load_cache(path: Path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def validate_one(payload):
+    condition_path_s, cache_root_s, sidecar_root_s = payload
+    condition_path = Path(condition_path_s)
+    cache_root = Path(cache_root_s)
+    sidecar_root = Path(sidecar_root_s)
+    sample = condition_path.parent.relative_to(cache_root)
+    sidecar_path = sidecar_root / sample / "sam3d_objects.pt"
+    if not sidecar_path.is_file():
+        return sample.as_posix(), "missing", False, False
+    try:
+        condition = load_cache(condition_path)
+        sidecar = load_cache(sidecar_path)
+
+        expected_shapes = {
+            "sam_masks": (8, 120, 160),
+            "sam_mask_meta": (8, 8),
+            "sam3d_geometry": (8, 120, 160),
+            "sam3d_shape_latents": (8, 256, 8),
+            "sam3d_object_pose": (8, 10),
+        }
+        tensors = {}
+        for key, expected_shape in expected_shapes.items():
+            tensor = torch.as_tensor(condition[key])
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(f"{key} shape {tuple(tensor.shape)} != {expected_shape}")
+            if not torch.isfinite(tensor).all():
+                raise ValueError(f"{key} contains NaN or Inf")
+            tensors[key] = tensor
+        if not torch.count_nonzero(tensors["sam3d_geometry"]):
+            raise ValueError("geometry is entirely zero")
+
+        object_count = int(torch.as_tensor(sidecar.get("object_count", 0)).item())
+        if object_count and not torch.count_nonzero(tensors["sam3d_shape_latents"][:object_count]):
+            raise ValueError("detected objects have zero shape latents")
+        if object_count and not torch.count_nonzero(tensors["sam3d_object_pose"][:object_count]):
+            raise ValueError("detected objects have zero poses")
+        empty_masks = not bool(torch.count_nonzero(tensors["sam_masks"]))
+        return sample.as_posix(), "complete", empty_masks, object_count == 0
+    except Exception as error:
+        return sample.as_posix(), f"invalid:{error}", False, False
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cache-root", type=Path, required=True)
+    parser.add_argument("--sidecar-root", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--workers", type=int, default=1)
+    args = parser.parse_args()
+    complete = []
+    missing = invalid = empty_masks = object_free = 0
+    problems = []
+    conditions = sorted(args.cache_root.glob("*/*/condition.pt"))
+    payloads = [(str(path), str(args.cache_root), str(args.sidecar_root)) for path in conditions]
+    if args.workers == 1:
+        results = map(validate_one, payloads)
+    else:
+        executor = ProcessPoolExecutor(max_workers=args.workers)
+        results = executor.map(validate_one, payloads, chunksize=16)
+    try:
+        for position, (sample, status, sample_empty_masks, sample_object_free) in enumerate(results, 1):
+            if status == "complete":
+                complete.append(sample)
+                empty_masks += int(sample_empty_masks)
+                object_free += int(sample_object_free)
+            elif status == "missing":
+                missing += 1
+            else:
+                invalid += 1
+                if len(problems) < 20:
+                    problems.append(f"{sample}: {status}")
+            if position % 1000 == 0 or position == len(payloads):
+                print(
+                    f"FULL_CONDITION_AUDIT position={position}/{len(payloads)} complete={len(complete)} "
+                    f"missing={missing} invalid={invalid} empty_masks={empty_masks} object_free={object_free}",
+                    flush=True,
+                )
+    finally:
+        if args.workers != 1:
+            executor.shutdown()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".native_full_index.", dir=args.output.parent)
+    os.close(descriptor)
+    try:
+        Path(temporary).write_text("\n".join(complete) + ("\n" if complete else ""), encoding="utf-8")
+        os.replace(temporary, args.output)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    if problems:
+        print("\n".join(problems), flush=True)
+    print(
+        f"NATIVE_INDEX complete={len(complete)} missing={missing} invalid={invalid} "
+        f"empty_masks={empty_masks} object_free={object_free} "
+        f"teacher_tokens_required=false output={args.output}"
+    )
+    if missing or invalid:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
