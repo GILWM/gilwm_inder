@@ -13,6 +13,7 @@ block gates make step zero exactly equivalent to the original Cosmos model.
 
 from __future__ import annotations
 
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -138,6 +139,7 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
         # one-dimensional because FSDP2 rejects scalar parameters.
         self.sam_modality_embeddings = nn.Parameter(torch.empty(6, crossattn_dim))
         self.sam_context_block_gates = nn.Parameter(torch.zeros(self.num_blocks))
+        self._sam3d_condition_proof_logged = False
         self._init_condition_weights()
 
     def _init_condition_weights(self) -> None:
@@ -316,6 +318,49 @@ class MinimalV1LVGSam3DDiT(MinimalV1LVGDiT):
             sam3d_shape_latents_B_K_N_D=sam3d_shape_latents_B_K_N_D,
             sam3d_object_pose_B_K_D=sam3d_object_pose_B_K_D,
         )
+
+        # Emit one machine-readable record per inference process.  Loading a
+        # sidecar alone is not sufficient evidence that it affects the model:
+        # the projected context and the learned residual gates must both be
+        # non-zero.  This uses the exact tensors passed to the training-time
+        # SAM/SAM3D branch, so evaluation launchers can fail closed when a
+        # condition was omitted or silently replaced by zero sentinels.
+        if os.environ.get("SAM3D_CONDITION_PROOF", "0") == "1" and not self._sam3d_condition_proof_logged:
+            input_tensors = {
+                "teacher": sam3d_tokens_B_F_N_D if self.sam3d_teacher_tokens_as_condition else None,
+                "mask": sam_mask_B_K_H_W,
+                "mask_meta": sam_mask_meta_B_K_D,
+                "geometry": sam3d_geometry_B_C_H_W,
+                "shape": sam3d_shape_latents_B_K_N_D,
+                "pose": sam3d_object_pose_B_K_D,
+            }
+            active_modalities = []
+            for name, value in input_tensors.items():
+                if value is not None and value.numel() > 0 and value.detach().float().abs().amax().item() > 0:
+                    active_modalities.append(name)
+            context_nonzero = 0
+            context_abs_mean = 0.0
+            context_shape = None
+            if sam_context_emb is not None:
+                context_float = sam_context_emb.detach().float()
+                context_nonzero = int(torch.count_nonzero(context_float).item())
+                context_abs_mean = float(context_float.abs().mean().item())
+                context_shape = tuple(sam_context_emb.shape)
+            effective_gates = (self.sam_context_block_gates * self.sam_condition_scale).detach().float()
+            gate_nonzero = int(torch.count_nonzero(effective_gates).item())
+            gate_abs_mean = float(effective_gates.abs().mean().item())
+            effective = context_nonzero > 0 and gate_nonzero > 0
+            print(
+                "SAM3D_CONDITION_PROOF "
+                f"effective={str(effective).lower()} "
+                f"active_modalities={','.join(active_modalities) or 'none'} "
+                f"teacher_as_condition={str(self.sam3d_teacher_tokens_as_condition).lower()} "
+                f"context_shape={context_shape} context_nonzero={context_nonzero} "
+                f"context_abs_mean={context_abs_mean:.8g} "
+                f"gate_nonzero={gate_nonzero} gate_abs_mean={gate_abs_mean:.8g}",
+                flush=True,
+            )
+            self._sam3d_condition_proof_logged = True
 
         return super().forward(
             x_B_C_T_H_W=x_B_C_T_H_W,
