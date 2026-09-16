@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+variant=${1:?usage: train_complete106k.sh semantic|action NODE_RANK}
+node_rank=${2:?set NODE_RANK}
+case "${variant}" in semantic|action) ;; *) echo "Unknown variant: ${variant}" >&2; exit 2 ;; esac
+export COSMOS_PROJECT=${COSMOS_PROJECT:-$(cd "$(dirname "$0")/../.." && pwd)}
+: "${COSMOS_SAM3D_WORKSPACE:?set COSMOS_SAM3D_WORKSPACE}"
+: "${COSMOS_MUSA_IMAGE:?set COSMOS_MUSA_IMAGE}"
+: "${SAM3D_DATASET_ROOT:?set SAM3D_DATASET_ROOT}"
+: "${SAM3D_CACHE_ROOT:?set SAM3D_CACHE_ROOT}"
+: "${SAM3D_OBJECTS_ROOT:?set SAM3D_OBJECTS_ROOT}"
+: "${SAM3D_NATIVE_INDEX:?set the frozen whitelist matching this variant}"
+: "${SAM3D_BASE_CHECKPOINT:?set the matching initialization checkpoint}"
+: "${MASTER_ADDR:?set MASTER_ADDR}"
+
+export DATASET_MANIFEST_PATHS=${DATASET_MANIFEST_PATHS:-"['${SAM3D_DATASET_ROOT}/manifest.jsonl']"}
+export INCLUDED_BATCHES="['worldarena2_wa2_50k_remaining','robotwin2_14d','core15k','flowwam_wa2_seed2_20260823','flowwam_wa2_seed3_20260823','flowwam_wa2_stage2_20260810']"
+export SAM3D_REQUIRED=true SAM3D_REQUIRE_COMPLETE_CONDITIONS=true
+export SAM3D_LOAD_TEACHER_TOKENS=false SAM3D_REPA_WEIGHT=0 ACTION_LOSS_WEIGHT=0
+export NUM_FRAMES=93 SAMPLING_MODE=uniform
+export NNODES=${NNODES:-4} NPROC_PER_NODE=${NPROC_PER_NODE:-8}
+export PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-4}
+export LEARNING_RATE=${LEARNING_RATE:-1.0e-5}
+export MAX_ITER=${MAX_ITER:-5000} SAVE_ITER=${SAVE_ITER:-500}
+export SCHEDULER_CYCLE_LENGTH=${SCHEDULER_CYCLE_LENGTH:-5000}
+export SCHEDULER_WARMUP_STEPS=${SCHEDULER_WARMUP_STEPS:-500}
+export SAM3D_RUN_NAME=${SAM3D_RUN_NAME:-gilwm-${variant}-complete106k-5k}
+if [[ "${variant}" == action ]]; then
+  : "${ACTION_NORM_PATH:?set the training action normalization statistics}"
+  export EXPECTED_DATASET_SAMPLES=${EXPECTED_DATASET_SAMPLES:-105498}
+  export CONTINUOUS_CONDITION_POLICY=drop_unaligned ACTION_VALIDATE_VECTOR=false
+  export ACTION_ALIGNMENT_OFFSET=0 ACTION_CONDITIONING_ENABLED=true
+  export ACTION_CONDITIONING_HIDDEN_DIM=8192 ACTION_CONDITIONING_ACTIONS_PER_LATENT=4
+  export ACTION_CONDITIONING_CLIP=10.0 ACTION_CONDITIONING_SCALE=0.01
+  export ACTION_CONDITIONING_TEMPORAL_RADIUS=4 ACTION_CONDITIONING_TEMPORAL_HIDDEN_DIM=64
+  export ACTION_CONDITIONING_OUTPUT_NORM=tanh ACTION_CONDITIONING_ZERO_INIT_OUTPUT=true
+  export ACTION_CONDITIONING_DROPOUT=0.1
+else
+  export ACTION_CONDITIONING_ENABLED=false ACTION_CONDITIONING_DROPOUT=0.0
+fi
+exec "${COSMOS_PROJECT}/projects/sam3d/train_v93.sh" "${node_rank}"

@@ -24,6 +24,11 @@ from cosmos_predict2._src.imaginaire.lazy_config.lazy import LazyConfig
 from cosmos_predict2._src.imaginaire.utils import distributed, log
 from cosmos_predict2._src.imaginaire.visualize.video import save_img_or_video
 from cosmos_predict2._src.predict2.inference.video2world import Video2WorldInference
+from cosmos_predict2._src.predict2.datasets.local_datasets.worldarena_action_hdf5 import (
+    ActionNormStats,
+    read_action_sequence,
+    resample_action_sequence,
+)
 from cosmos_predict2.config import InferenceArguments, SetupArguments, path_to_str
 
 
@@ -92,6 +97,19 @@ class Inference:
     def _generate_sample(self, sample: InferenceArguments, output_dir: Path) -> str | None:
         log.debug(f"{sample.__class__.__name__}({sample})")
         output_path = output_dir / sample.name
+        action = None
+        if sample.action_hdf5_path is not None:
+            raw_action = read_action_sequence(sample.action_hdf5_path, validate_vector=False)
+            aligned_action, action_indices = resample_action_sequence(
+                raw_action,
+                target_frames=sample.num_output_frames,
+            )
+            action = torch.from_numpy(ActionNormStats.load(sample.action_norm_path).normalize(aligned_action))
+            log.info(
+                f"Loaded action condition {sample.action_hdf5_path}: "
+                f"{len(raw_action)} -> {len(aligned_action)} frames, "
+                f"source indices [{int(action_indices[0])}, {int(action_indices[-1])}]"
+            )
 
         if self.rank0:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -120,14 +138,17 @@ class Inference:
                 prompt=sample.prompt,
                 input_path=path_to_str(sample.input_path),
                 sam3d_condition_path=path_to_str(sample.sam3d_condition_path),
+                first_frame_resize_resolution=sample.first_frame_resize_resolution,
                 num_output_frames=sample.num_output_frames,
                 chunk_size=sample.chunk_size,
                 chunk_overlap=sample.chunk_overlap,
                 guidance=sample.guidance,
                 num_latent_conditional_frames=sample.num_input_frames,
                 resolution=sample.resolution,
+                fps=sample.fps,
                 seed=sample.seed,
                 negative_prompt=sample.negative_prompt,
+                action=action,
                 num_steps=sample.num_steps,
             )
         else:
@@ -136,12 +157,15 @@ class Inference:
                 prompt=sample.prompt,
                 input_path=path_to_str(sample.input_path),
                 sam3d_condition_path=path_to_str(sample.sam3d_condition_path),
+                first_frame_resize_resolution=sample.first_frame_resize_resolution,
                 guidance=sample.guidance,
                 num_video_frames=sample.num_output_frames,
                 num_latent_conditional_frames=sample.num_input_frames,
                 resolution=sample.resolution,
+                fps=sample.fps,
                 seed=sample.seed,
                 negative_prompt=sample.negative_prompt,
+                action=action,
                 num_steps=sample.num_steps,
             )
 
@@ -169,6 +193,25 @@ class Inference:
             else:
                 log.warning("Guardrail checks on video are disabled")
 
-            save_img_or_video(video, str(output_path), fps=int(os.environ.get("COSMOS_OUTPUT_FPS", "24")))
+            # Evaluation videos are scientific artifacts: avoid the low-bitrate
+            # defaults selected by imageio for generic MP4 output.  Lossless
+            # H.264 keeps the container convenient for the evaluator while
+            # preserving the uint8 frames passed to the encoder.
+            save_img_or_video(
+                video,
+                str(output_path),
+                fps=int(sample.fps),
+                quality=None,
+                ffmpeg_params=[
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "medium",
+                    "-qp",
+                    "0",
+                    "-crf",
+                    "0",
+                ],
+            )
             log.success(f"Saved video to {output_path}.mp4")
         return f"{output_path}.mp4"

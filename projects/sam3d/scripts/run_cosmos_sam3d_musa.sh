@@ -13,6 +13,23 @@ vae_path="${model_root}/nvidia/Cosmos-Predict2.5-2B/tokenizer.pth"
 torch_home="${workspace}/weights/torch"
 pythonpath="${project}:${project}/packages/cosmos-oss:${project}/packages/cosmos-cuda:${workspace}/third_party/sam3-musa:/usr/local/lib/python3.10/dist-packages:/usr/lib/python3/dist-packages"
 
+mccl_env=()
+for key in \
+  MCCL_IB_GID_INDEX \
+  MCCL_IB_HCA \
+  MCCL_SOCKET_IFNAME \
+  MCCL_DEBUG \
+  MCCL_DEBUG_SUBSYS \
+  MCCL_PROTOS \
+  MCCL_ALGOS \
+  MCCL_BUFFSIZE \
+  MCCL_MIN_NRINGS \
+  MCCL_MAX_NRINGS; do
+  if [[ -n "${!key:-}" ]]; then
+    mccl_env+=(-e "${key}=${!key}")
+  fi
+done
+
 for required in "${python}" "${vae_path}"; do
   if [[ ! -e "${required}" ]]; then
     echo "Required independent runtime artifact is missing: ${required}" >&2
@@ -21,15 +38,55 @@ for required in "${python}" "${vae_path}"; do
 done
 
 mount_args=(-v "${workspace}:${workspace}")
+if [[ "${project}" != "${workspace}"/* ]]; then
+  mount_args+=(-v "${project}:${project}")
+fi
 for bind_path in \
   "${SAM3D_DATASET_ROOT:-}" \
   "${SAM3D_CACHE_ROOT:-}" \
   "${SAM3D_OBJECTS_ROOT:-}" \
   "${SAM3D_BASE_CHECKPOINT:-}" \
-  "${SAM3D_COSMOS_OVERLAY_CHECKPOINT:-}"; do
+  "${SAM3D_COSMOS_OVERLAY_CHECKPOINT:-}" \
+  "${ACTION_NORM_PATH:-}" \
+  "${SAM3D_NATIVE_INDEX:-}"; do
   if [[ -n "${bind_path}" && -e "${bind_path}" && "${bind_path}" != "${workspace}"/* ]]; then
     mount_args+=(-v "${bind_path}:${bind_path}")
   fi
+done
+
+# Filtered dataset views can contain symlinks whose targets live outside the
+# manifest directory. Mount each requested root so those links also resolve
+# inside the container.
+IFS=: read -r -a extra_bind_paths <<< "${COSMOS_EXTRA_BIND_PATHS:-}"
+for bind_path in "${extra_bind_paths[@]}"; do
+  if [[ -n "${bind_path}" && -e "${bind_path}" && "${bind_path}" != "${workspace}"/* ]]; then
+    mount_args+=(-v "${bind_path}:${bind_path}")
+  fi
+done
+
+# Some compact dataset views contain absolute symlinks whose in-container
+# target differs from the host path.  COSMOS_EXTRA_BIND_PATHS intentionally
+# means path:path and therefore cannot express that mapping.  Accept explicit
+# semicolon-separated source=destination mounts without overloading ':' (which
+# is already the list separator above).
+IFS=';' read -r -a extra_bind_mounts <<< "${COSMOS_EXTRA_BIND_MOUNTS:-}"
+for bind_mount in "${extra_bind_mounts[@]}"; do
+  [[ -z "${bind_mount}" ]] && continue
+  if [[ "${bind_mount}" != *=* ]]; then
+    echo "Invalid COSMOS_EXTRA_BIND_MOUNTS entry (expected source=destination): ${bind_mount}" >&2
+    exit 2
+  fi
+  bind_source=${bind_mount%%=*}
+  bind_destination=${bind_mount#*=}
+  if [[ ! -e "${bind_source}" ]]; then
+    echo "COSMOS_EXTRA_BIND_MOUNTS source does not exist: ${bind_source}" >&2
+    exit 2
+  fi
+  if [[ "${bind_destination}" != /* ]]; then
+    echo "COSMOS_EXTRA_BIND_MOUNTS destination must be absolute: ${bind_destination}" >&2
+    exit 2
+  fi
+  mount_args+=(-v "${bind_source}:${bind_destination}")
 done
 
 exec docker run --rm --privileged --network host --ipc host \
@@ -55,4 +112,5 @@ exec docker run --rm --privileged --network host --ipc host \
   -e "OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}" \
   -e "KMP_DUPLICATE_LIB_OK=${KMP_DUPLICATE_LIB_OK:-TRUE}" \
   -e "MUSA_VISIBLE_DEVICES=${MUSA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}" \
+  "${mccl_env[@]}" \
   "${image}" "${python}" "$@"

@@ -20,6 +20,7 @@ SAM3D_CACHE_ROOT = "/datahdd/mccxadmin/cosmos-sam3d-cache/v1"
 
 sam3d_dataset = L(SAM3DVideoDataset)(
     dataset_dir=DATASET_ROOT,
+    manifest_paths=None,
     sam3d_cache_dir=SAM3D_CACHE_ROOT,
     sam3d_required=True,
     included_batches=["legacy4k", "core15k"],
@@ -42,6 +43,16 @@ sam3d_dataset = L(SAM3DVideoDataset)(
     repeat_factor=1,
     sam3d_native_index=None,
     sam3d_objects_root=None,
+    # WorldArena/RoboTwin HDF5 trajectories are optional sidecars. They are
+    # enabled explicitly by the action-supervised launcher.
+    action_hdf5_root=None,
+    action_required=False,
+    action_norm_path=None,
+    action_alignment_offset=0,
+    action_validate_vector=True,
+    expected_num_samples=None,
+    continuous_condition_policy="restrict",
+    max_load_retries=8,
 )
 
 sam3d_dataloader = L(get_generic_dataloader)(
@@ -117,6 +128,47 @@ predict2_video2world_training_2b_sam3d_full = _base_experiment(
     sam3d_dataloader,
 )
 
+# Inference must instantiate exactly the same action branch as training.
+# Passing an action H5 alone is insufficient when the selected experiment has
+# action conditioning disabled: the checkpoint's action MLP would otherwise be
+# ignored during partial loading.
+predict2_video2world_inference_2b_sam3d_action = copy.deepcopy(
+    predict2_video2world_training_2b_sam3d_full
+)
+predict2_video2world_inference_2b_sam3d_action["job"]["name"] = "2b_sam3d_action_inference"
+predict2_video2world_inference_2b_sam3d_action["model"] = dict(
+    config=dict(
+        action_loss_weight=0.0,
+        net=dict(
+            action_conditioning_enabled=True,
+            action_conditioning_hidden_dim=8192,
+            action_conditioning_actions_per_latent=4,
+            action_conditioning_clip=10.0,
+            action_conditioning_scale=0.01,
+        ),
+    )
+)
+
+# New checkpoints only: learn a soft local temporal alignment instead of
+# fixing one global HDF5/video offset. Historical action checkpoints must keep
+# using the legacy inference experiment above because their conditioner was
+# trained with LayerNorm and no temporal mixer.
+predict2_video2world_inference_2b_sam3d_action_temporal = copy.deepcopy(
+    predict2_video2world_inference_2b_sam3d_action
+)
+predict2_video2world_inference_2b_sam3d_action_temporal["job"]["name"] = (
+    "2b_sam3d_action_temporal_inference"
+)
+predict2_video2world_inference_2b_sam3d_action_temporal["model"]["config"]["net"].update(
+    action_conditioning_temporal_radius=4,
+    action_conditioning_temporal_hidden_dim=64,
+    action_conditioning_output_norm="tanh",
+    action_conditioning_zero_init_output=True,
+    # Dropout is active only in train() mode and is therefore safe to retain
+    # in the structurally matching inference configuration.
+    action_conditioning_dropout=0.1,
+)
+
 smoke_dataset = copy.deepcopy(sam3d_dataset)
 smoke_dataset.sam3d_required = False
 smoke_dataset.included_batches = ["legacy4k"]
@@ -139,6 +191,8 @@ predict2_video2world_training_2b_sam3d_smoke["checkpoint"]["save_iter"] = 10
 cs = ConfigStore.instance()
 for _item in (
     predict2_video2world_training_2b_sam3d_full,
+    predict2_video2world_inference_2b_sam3d_action,
+    predict2_video2world_inference_2b_sam3d_action_temporal,
     predict2_video2world_training_2b_sam3d_smoke,
 ):
     experiment_name = [name.lower() for name, value in globals().items() if value is _item][0]

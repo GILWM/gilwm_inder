@@ -10,6 +10,12 @@
 
 ![Method overview](docs/method_overview.png)
 
+## Complete106k 与动作模型复现
+
+最新 semantic/action 训练入口、模型身份、初始化依赖和推理设置见
+[开源准备复现说明](docs/release_reproduction.md)。动作模型包含 temporal mixer，
+训练与推理需使用匹配的 temporal 实验配置。
+
 ## 方法概览
 
 给定文本指令、首帧和训练视频，本方法在 Cosmos Predict2.5 2B Video2World 主干上增加结构条件通路：

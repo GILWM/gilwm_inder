@@ -15,6 +15,7 @@
 
 """Generic video dataset loader for Cosmos Predict2."""
 
+import fcntl
 import json
 import os
 import random
@@ -24,7 +25,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-import fcntl
 import numpy as np
 import torch
 from decord import VideoReader, cpu
@@ -46,6 +46,7 @@ class VideoDataset(Dataset):
         prompt_type: str | None = None,  # "long", "short", "medium", or None for auto
         caption_format: str = "auto",  # "text", "json", or "auto"
         video_paths: Optional[list[str]] = None,
+        manifest_paths: Optional[list[str]] = None,
         included_batches: Optional[list[str]] = None,
         sampling_mode: str = "uniform",
         filter_short_videos: bool = True,
@@ -60,6 +61,8 @@ class VideoDataset(Dataset):
                                      If None, uses the first available prompt type.
                                      Only applicable when using JSON format.
             caption_format (str): Caption format - "text", "json", or "auto" to detect automatically
+            manifest_paths (list[str] | None): Optional manifest files. Relative
+                fields are resolved against each manifest's own directory.
 
         Returns dict with:
             - video: RGB frames tensor [T,C,H,W]
@@ -72,28 +75,46 @@ class VideoDataset(Dataset):
         self.prompt_type = prompt_type
         self.caption_format = caption_format
         self.included_batches = included_batches
+        self._explicit_manifest_paths = manifest_paths is not None
+        self._manifest_frame_counts: dict[str, int] = {}
         if sampling_mode not in {"continuous", "uniform"}:
             raise ValueError(f"Unsupported sampling_mode: {sampling_mode}")
         self.sampling_mode = sampling_mode
         self.caption_paths: Optional[list[str]] = None
         video_dir = os.path.join(self.dataset_dir, "videos")
         manifest_path = os.path.join(self.dataset_dir, "manifest.jsonl")
+        self.manifest_paths = (
+            [os.path.abspath(os.fspath(path)) for path in manifest_paths]
+            if manifest_paths is not None
+            else ([manifest_path] if os.path.isfile(manifest_path) else [])
+        )
 
         if video_paths is None:
-            if os.path.isfile(manifest_path):
-                records = []
-                with open(manifest_path, encoding="utf-8") as manifest_file:
-                    for line_number, line in enumerate(manifest_file, 1):
-                        if not line.strip():
-                            continue
-                        record = json.loads(line)
-                        if "video" not in record or "instruction" not in record:
-                            raise ValueError(f"Invalid manifest record at line {line_number}: {record}")
-                        if self.included_batches is not None and record.get("batch") not in self.included_batches:
-                            continue
-                        records.append(record)
-                self.video_paths = [os.path.join(self.dataset_dir, item["video"]) for item in records]
-                self.caption_paths = [os.path.join(self.dataset_dir, item["instruction"]) for item in records]
+            if self.manifest_paths:
+                records: list[tuple[dict[str, Any], str]] = []
+                for current_manifest in self.manifest_paths:
+                    if not os.path.isfile(current_manifest):
+                        raise FileNotFoundError(current_manifest)
+                    manifest_base = os.path.dirname(current_manifest)
+                    with open(current_manifest, encoding="utf-8") as manifest_file:
+                        for line_number, line in enumerate(manifest_file, 1):
+                            if not line.strip():
+                                continue
+                            record = json.loads(line)
+                            if "video" not in record or "instruction" not in record:
+                                raise ValueError(
+                                    f"Invalid manifest record at {current_manifest}:{line_number}: {record}"
+                                )
+                            if self.included_batches is not None and record.get("batch") not in self.included_batches:
+                                continue
+                            records.append((record, manifest_base))
+                self.video_paths = [os.path.normpath(os.path.join(base, item["video"])) for item, base in records]
+                self.caption_paths = [
+                    os.path.normpath(os.path.join(base, item["instruction"])) for item, base in records
+                ]
+                for (record, _), resolved_video in zip(records, self.video_paths):
+                    if record.get("frame_count") is not None:
+                        self._manifest_frame_counts[resolved_video] = int(record["frame_count"])
                 self.caption_format = "json"
             else:
                 self._setup_caption_format()
@@ -133,7 +154,12 @@ class VideoDataset(Dataset):
             frame_count_by_path: dict[str, int] = {}
             missing_entries: list[tuple[str, str]] = []
             trust_cache = os.environ.get("COSMOS_VIDEO_TRUST_FRAME_CACHE", "1") == "1"
+            trust_manifest = os.environ.get("COSMOS_VIDEO_TRUST_MANIFEST_FRAME_COUNT", "1") == "1"
             for video_path in self.video_paths:
+                manifest_frame_count = self._manifest_frame_counts.get(video_path)
+                if trust_manifest and manifest_frame_count is not None:
+                    frame_count_by_path[video_path] = manifest_frame_count
+                    continue
                 cached = cache.get(video_path)
                 if trust_cache and cached is not None:
                     frame_count_by_path[video_path] = int(cached["frame_count"])
@@ -216,7 +242,44 @@ class VideoDataset(Dataset):
     def __len__(self) -> int:
         return len(self.video_paths)
 
-    def _load_video(self, video_path: str) -> tuple[np.ndarray, float]:
+    def _sample_frame_ids(
+        self,
+        total_frames: int,
+        continuous_start_frames: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Choose source-frame indices for one sample.
+
+        Keeping this operation separate lets sidecar modalities (for example
+        robot actions) use the exact same timestamps as the decoded video.
+        """
+
+        if total_frames < self.sequence_length:
+            raise ValueError(
+                f"Video has only {total_frames} frames, at least {self.sequence_length} frames are required."
+            )
+        if self.sampling_mode == "continuous":
+            max_start_idx = total_frames - self.sequence_length
+            if continuous_start_frames is None:
+                start_frame = np.random.randint(0, max_start_idx + 1)
+            else:
+                candidates = np.asarray(continuous_start_frames, dtype=np.int64).reshape(-1)
+                candidates = np.unique(candidates[(candidates >= 0) & (candidates <= max_start_idx)])
+                if not len(candidates):
+                    raise ValueError(
+                        "No cached condition frame can start a contiguous "
+                        f"{self.sequence_length}-frame crop in a {total_frames}-frame video"
+                    )
+                start_frame = int(candidates[np.random.randint(len(candidates))])
+            return np.arange(start_frame, start_frame + self.sequence_length, dtype=np.int64)
+        # Uniform sampling spans the complete timeline, preserves frame zero,
+        # and includes the last source frame.
+        return np.rint(np.linspace(0, total_frames - 1, self.sequence_length)).astype(np.int64)
+
+    def _load_video_with_frame_ids(
+        self,
+        video_path: str,
+        continuous_start_frames: Optional[np.ndarray] = None,
+    ) -> tuple[np.ndarray, float, np.ndarray, int]:
         vr = VideoReader(video_path, ctx=cpu(0), num_threads=2)
         total_frames = len(vr)
         if total_frames < self.sequence_length:
@@ -225,16 +288,9 @@ class VideoDataset(Dataset):
                 f"at least {self.sequence_length} frames are required."
             )
 
-        if self.sampling_mode == "continuous":
-            max_start_idx = total_frames - self.sequence_length
-            start_frame = np.random.randint(0, max_start_idx + 1)
-            frame_ids = np.arange(start_frame, start_frame + self.sequence_length).tolist()
-        else:
-            # Uniformly sample the complete video timeline. This always preserves
-            # the first frame (index 0) and also includes the final frame.
-            frame_ids = np.rint(np.linspace(0, total_frames - 1, self.sequence_length)).astype(np.int64).tolist()
+        frame_ids = self._sample_frame_ids(total_frames, continuous_start_frames=continuous_start_frames)
 
-        frame_data = vr.get_batch(frame_ids).asnumpy()
+        frame_data = vr.get_batch(frame_ids.tolist()).asnumpy()
         vr.seek(0)  # set video reader point back to 0 to clean up cache
 
         try:
@@ -246,6 +302,10 @@ class VideoDataset(Dataset):
         if self.sampling_mode == "uniform" and total_frames > 1:
             fps = fps * (self.sequence_length - 1) / (total_frames - 1)
         del vr  # delete the reader to avoid memory leak
+        return frame_data, fps, frame_ids, total_frames
+
+    def _load_video(self, video_path: str) -> tuple[np.ndarray, float]:
+        frame_data, fps, _, _ = self._load_video_with_frame_ids(video_path)
         return frame_data, fps
 
     def _setup_caption_format(self) -> None:
@@ -321,12 +381,26 @@ class VideoDataset(Dataset):
             log.warning(f"Failed to read JSON caption file {json_path}: {e}")
             return ""
 
-    def _get_frames(self, video_path: str) -> tuple[torch.Tensor, float]:
-        frames, fps = self._load_video(video_path)
+    def _preprocess_frames(self, frames: np.ndarray) -> torch.Tensor:
         frames = frames.astype(np.uint8)
         frames = torch.from_numpy(frames).permute(0, 3, 1, 2)  # [T, C, H, W]
         frames = self.preprocess(frames)
         frames = torch.clamp(frames * 255.0, 0, 255).to(torch.uint8)
+        return frames
+
+    def _get_frames_with_frame_ids(
+        self,
+        video_path: str,
+        continuous_start_frames: Optional[np.ndarray] = None,
+    ) -> tuple[torch.Tensor, float, np.ndarray, int]:
+        frames, fps, frame_ids, total_frames = self._load_video_with_frame_ids(
+            video_path,
+            continuous_start_frames=continuous_start_frames,
+        )
+        return self._preprocess_frames(frames), fps, frame_ids, total_frames
+
+    def _get_frames(self, video_path: str) -> tuple[torch.Tensor, float]:
+        frames, fps, _, _ = self._get_frames_with_frame_ids(video_path)
         return frames, fps
 
     def __getitem__(self, index: int) -> dict | Any:

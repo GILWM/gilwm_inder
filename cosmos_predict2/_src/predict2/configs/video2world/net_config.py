@@ -130,6 +130,29 @@ COSMOS_V1_2B_SAM3D_NET: LazyDict = L(MinimalV1LVGSam3DDiT)(
     # Disabled in the legacy relation-loss experiment. New projected-REPA
     # launches override this to the frozen DINO teacher width (768).
     sam3d_repa_projection_dim=None,
+    # Optional lightweight inverse-dynamics head. Kept None for checkpoint
+    # compatibility; action-supervised launches override it (typically 512).
+    action_supervision_hidden_dim=None,
+    action_supervision_architecture="lightweight",
+    action_supervision_num_layers=6,
+    action_supervision_num_heads=8,
+    action_supervision_ffn_multiplier=4,
+    action_supervision_pool_grid=2,
+    action_dim=14,
+    # True action-conditioned generation.  Disabled for old checkpoints and
+    # enabled explicitly by action training/inference launchers.
+    action_conditioning_enabled=False,
+    action_conditioning_hidden_dim=None,
+    action_conditioning_actions_per_latent=4,
+    action_conditioning_clip=10.0,
+    action_conditioning_scale=0.01,
+    # Legacy-safe defaults. New temporal-action experiments enable these
+    # explicitly so historical checkpoints keep their exact architecture.
+    action_conditioning_temporal_radius=0,
+    action_conditioning_temporal_hidden_dim=64,
+    action_conditioning_output_norm="layernorm",
+    action_conditioning_zero_init_output=False,
+    action_conditioning_dropout=0.0,
     # Full-video DINO features are teacher-only by default.  Set True only to
     # reproduce legacy experiments that exposed future teacher frames as input.
     sam3d_teacher_tokens_as_condition=False,

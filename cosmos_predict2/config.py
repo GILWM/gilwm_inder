@@ -442,12 +442,20 @@ class InferenceArguments(CommonInferenceArguments):
     """Optional and ignored for TEXT2WORLD. Required path to the image if inference_type is IMAGE2WORLD or video if inference_type is VIDEO2WORLD."""
     sam3d_condition_path: ResolvedFilePath | None = None
     """Optional fixed-shape condition.pt containing DINO, SAM masks, geometry, native SAM 3D shape latents and poses."""
+    action_hdf5_path: ResolvedFilePath | None = None
+    """Optional WorldArena trajectory HDF5. Its official 14-D joint_action fields condition every generated frame."""
+    action_norm_path: ResolvedFilePath | None = None
+    """Z-score statistics used for action training. Required with action_hdf5_path so train/inference normalization matches."""
+    first_frame_resize_resolution: str | None = None
+    """Optional H,W pre-resize applied only to an image first frame before normal model-resolution preprocessing."""
 
     # Advanced parameters
     resolution: str = "480,640"
     """Resolution of the video (H,W). Be default it will use model trained resolution. 9:16"""
     num_output_frames: pydantic.PositiveInt = 121
     """Number of video frames to generate"""
+    fps: pydantic.PositiveInt = 24
+    """Temporal FPS condition used by the DiT and the encoded output video."""
     num_steps: pydantic.PositiveInt = 1 if SMOKE else 35
     """Number of generation steps."""
 
@@ -485,6 +493,17 @@ class InferenceArguments(CommonInferenceArguments):
                 raise ValueError(
                     f"input_path has unsupported file extension '{self.input_path.suffix}' for inference type {self.inference_type}. Supported extensions: {supported_extensions}"
                 )
+        if (self.action_hdf5_path is None) != (self.action_norm_path is None):
+            raise ValueError("action_hdf5_path and action_norm_path must be provided together")
+        if self.first_frame_resize_resolution is not None:
+            try:
+                first_frame_resolution = tuple(
+                    int(value) for value in self.first_frame_resize_resolution.split(",")
+                )
+            except ValueError as error:
+                raise ValueError("first_frame_resize_resolution must use positive integer H,W") from error
+            if len(first_frame_resolution) != 2 or any(value <= 0 for value in first_frame_resolution):
+                raise ValueError("first_frame_resize_resolution must use positive integer H,W")
         return self
 
     @cached_property

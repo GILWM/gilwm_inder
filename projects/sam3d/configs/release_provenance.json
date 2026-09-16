@@ -1,0 +1,213 @@
+{
+  "snapshot_date": "2026-09-16",
+  "base_commit": "9ed1bbf24705f24dda16e1780e2f71e2b1b0f5ad",
+  "deployment_snapshot": "action-alignment-audit-code-20260820",
+  "note": "Release paths and launchers are adapted; deployment and release hashes intentionally differ where documented. No remote deployment was overwritten.",
+  "files": [
+    {
+      "path": ".pytest.ini",
+      "release_sha256": "729ce656b963041be8676b3f2eabfd15720d991f1e9792813f90e7d81633a3b8"
+    },
+    {
+      "path": "README.md",
+      "release_sha256": "d0993cba3011dd0bf89d76aefa9c945193bc3862ba0dbc19bef41a7136500fed",
+      "deployment_sha256": "351f5fb03d98a9f47c1af9a4e568bc2d7978a624aec72e0048416d3067d6d73a"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/callbacks/iter_speed.py",
+      "release_sha256": "c59e046bcfcf7516a6272dc99b6e623b071c1e7d5f4e899d294b694e48d09b0d",
+      "deployment_sha256": "f96bd52e7f4477787f7a56449b3af867687f9855661c8c586861e25411ae5a58"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/configs/video2world/defaults/model.py",
+      "release_sha256": "382e96844180525ff8a4c1134445a64b0b2bd1a1f60cb2bbb801cbbd2dae8414",
+      "deployment_sha256": "47512b3a2c47da0e07d68827aa1673d176f7ac0970f36f5eb21f62d5b83c5187"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/configs/video2world/defaults/net.py",
+      "release_sha256": "cc1ea85367d57787ea88c0ce62ad5422f8454aa2eb52e5d9a8be184edead51c3",
+      "deployment_sha256": "c4f63e4a775f8207d68508747e197ef382a95dad14504cc6a984fb159dad1d5d"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/configs/video2world/model_config.py",
+      "release_sha256": "3386ef8ab2b1d4fb9a2267331c1caea9c6b6bdc496e31774b66d1319a7ff8c9c",
+      "deployment_sha256": "61b90616e999e2cb78c0c26e671d1df9b89c0cfb5481b220903ac3582a492c7d"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/configs/video2world/net_config.py",
+      "release_sha256": "2b70510198c7c1e591fa20caf2dc94c0c3324bb60c1efdd53fcfea10fd592a52",
+      "deployment_sha256": "4f60bec164aef3a4e10648644999883fceae6c19f931273e98722e0d5ccc72f5"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/datasets/local_datasets/dataset_video.py",
+      "release_sha256": "c6930b8c5d4d8f4ce8e722be4d5de73de3df1fb66b8c867f6c461c3729392300",
+      "deployment_sha256": "e4e1ebcc1eb746891f87bc39a80fbacf6082ac41c108a62d7ca4cc1e0c56214c"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/datasets/local_datasets/sam3d_video_dataset.py",
+      "release_sha256": "e53d4e97961aab54c35bd6870feb513754e92b3a9eb9eab019d4061670df9b02",
+      "deployment_sha256": "ce3c60d7aba033fcb814af56dd2193ee6fa4aa923ccb11b834b6baa46c984598"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/datasets/local_datasets/worldarena_action_hdf5.py",
+      "release_sha256": "abb4fe0df1f0db42b9b92bce969a42ac1ef978b86c638d7d7fd1e7f93bf699cd",
+      "deployment_sha256": "abb4fe0df1f0db42b9b92bce969a42ac1ef978b86c638d7d7fd1e7f93bf699cd"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/inference/video2world.py",
+      "release_sha256": "cd48ee570434bc48bd38eb86757198db7f92dd95344c5026a7e231ae94f948ae",
+      "deployment_sha256": "a4f1ac18afce5566bf11cc7c74ab498f00e179bf1793aa1161e5887399a483fe"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/models/sam3d_video2world_model.py",
+      "release_sha256": "a1b86c3dc9b81a4c5f38797443784ec2b89e64e14fc2790a26db6767f9bb505c",
+      "deployment_sha256": "b6ee210e107df64e244ba5d590d1d13526ad14d92fdf0c894dd23223e0060916"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/networks/minimal_v1_lvg_dit.py",
+      "release_sha256": "62c5ad3745f1e71e862633c79784845b18727a5e964265c02d71e0b049c9e9f8",
+      "deployment_sha256": "895442fbf4fea52bd6631bc3211d334c9d6a201521fc70b19ddc611096682923"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/networks/minimal_v4_dit.py",
+      "release_sha256": "4ff0736b7b3f104eb3998779ef7da16ad8522755b3fa5a04d8da20de9efcb364",
+      "deployment_sha256": "99ed0b2796f87c992671f2952c4376e52748b84d3a6d0d6453aee227ad03bcbb"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/networks/sam3d_conditioned_dit.py",
+      "release_sha256": "3de3572bfc472146345866e70310c015a7b32fe89c222636a2377795b509fbcd",
+      "deployment_sha256": "de65b489d5addb1f28c73df799481e60bae6a24747eb14abe527f7ba0560cb67"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/sam3d/action_alignment.py",
+      "release_sha256": "d38fbd5167f0b36768ff8485237fb763dea0bbeb0d67268276660ac358f3c8f7",
+      "deployment_sha256": "b407063fced382a42ee2f775009581b33935bc3daab5ba48756a6fdea5fe5e4a"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/sam3d/conditioner.py",
+      "release_sha256": "99e1cbfa288d8a1e84e80bf6e64a5bd3f7ffbe54f76bd8807f91c5968ab52bb5",
+      "deployment_sha256": "acb7359bb247b4e87f559d2fce108969c4af9ac8c7d7eae0e783b00ecd46a2cd"
+    },
+    {
+      "path": "cosmos_predict2/_src/predict2/sam3d/video_mask_supervision.py",
+      "release_sha256": "06028b7a7ae875fde1f85be88de0a5ca029cb4ceb85e0a6c91c169120de6c4b6",
+      "deployment_sha256": "06028b7a7ae875fde1f85be88de0a5ca029cb4ceb85e0a6c91c169120de6c4b6"
+    },
+    {
+      "path": "cosmos_predict2/config.py",
+      "release_sha256": "981e0f8a714c273c585730b803e04bce751c100e2bd19bbca2577d80eeb50bda",
+      "deployment_sha256": "6b74a1fc0ceda2ed7ecb7a4006fc3b32eb8ea2184c1f898bd184509b8d229344"
+    },
+    {
+      "path": "cosmos_predict2/experiments/sam3d_world_model.py",
+      "release_sha256": "44dbcf0578c96ed0b6e202ea2d0577165da0bbd2d96563d00f238ddac8c92b7c",
+      "deployment_sha256": "10469095e8fade1c1c83f2de4a93ce0de3d506650fe9a1709e81806facaed33a"
+    },
+    {
+      "path": "cosmos_predict2/inference.py",
+      "release_sha256": "64ee5a2296a3de00cc958620a68e08bf38cb4ad23fa980f46a4c9dbbaba3b9ee",
+      "deployment_sha256": "b7b5717c63618a8f267d21960667f554a32dd023940ccdda6ac53ae03bfaf1a0"
+    },
+    {
+      "path": "docs/release_reproduction.md",
+      "release_sha256": "6a2208e400e9c07da9886ea20517c4736e3dc794e5e35318c440ce49f34fd30c"
+    },
+    {
+      "path": "projects/sam3d/configs/release.env.example",
+      "release_sha256": "04e7534daedd0a5c51296d33b748d307123adb1f05a26af6e828b435daee1feb"
+    },
+    {
+      "path": "projects/sam3d/scripts/audit_sam3d_action_benchmark50_inputs.py",
+      "release_sha256": "9929186e0f1eab2bc90b3764595e0ab4c121010969fd5ce16859597ca40e9096",
+      "deployment_sha256": "9929186e0f1eab2bc90b3764595e0ab4c121010969fd5ce16859597ca40e9096"
+    },
+    {
+      "path": "projects/sam3d/scripts/audit_sam3d_benchmark50_outputs.py",
+      "release_sha256": "5d9623fd3a95461b2e84550f021bac2ffb77ca2b4c7de0f511cdf1681c875dd3",
+      "deployment_sha256": "c0bf4f195a0bb5b2e70a03e598b2391cc31e7803aa00b28afeaf6a7118aa336d"
+    },
+    {
+      "path": "projects/sam3d/scripts/audit_video_action_alignment.py",
+      "release_sha256": "49ed8d624c8597e226c27fdd032d1d5c5d54c2edeaa07bbbf5c784163e10ac7d",
+      "deployment_sha256": "49ed8d624c8597e226c27fdd032d1d5c5d54c2edeaa07bbbf5c784163e10ac7d"
+    },
+    {
+      "path": "projects/sam3d/scripts/audit_worldarena_action_hdf5.py",
+      "release_sha256": "54dd6746c7780910c81b27c6ecb44b50a8d46e17d79a115ac400f5f62d286081",
+      "deployment_sha256": "56d8c3d6bdaeb82982359f1d03520387cd2b68d6ce3cd85ecff6f8b5f0ab5d5b"
+    },
+    {
+      "path": "projects/sam3d/scripts/prepare_action_benchmark50_ar.py",
+      "release_sha256": "3781162bbddab6cfe0de899ba80a7dfc12dc15d13dfea3f3eeadbe95cc5a18b2",
+      "deployment_sha256": "3781162bbddab6cfe0de899ba80a7dfc12dc15d13dfea3f3eeadbe95cc5a18b2"
+    },
+    {
+      "path": "projects/sam3d/scripts/prepare_sam3d_action_benchmark50_ar.py",
+      "release_sha256": "18d67de6a6dc7b954d54c5db858b83f236c966e28c7abab7584157f13d4b2127",
+      "deployment_sha256": "18d67de6a6dc7b954d54c5db858b83f236c966e28c7abab7584157f13d4b2127"
+    },
+    {
+      "path": "projects/sam3d/scripts/run_action_conditioned_inference_smoke.sh",
+      "release_sha256": "81c1d0ebed7935a06b3f5c22750adf0d4eeb02d5ee17d116efa5229c8dbe4cec",
+      "deployment_sha256": "6499efdf9a60bdd5d0a7ba912967c43d7f6827a65cfa65b95bd01ca0e35530fd"
+    },
+    {
+      "path": "projects/sam3d/scripts/run_cosmos_sam3d_musa.sh",
+      "release_sha256": "0f61d089a37ea7ffe54f633cfa185d8835c620af4ccac5fb2b97145a1e22649d",
+      "deployment_sha256": "0b93c3f75d188a97ee86434f71405810818785378a406b5996428654ce2f5490"
+    },
+    {
+      "path": "projects/sam3d/scripts/run_temporal_action_conditioned_inference_smoke.sh",
+      "release_sha256": "82b7304ce4c8351a79f0de20a051e1489cb398b6f14b420b832150db169c9e6b",
+      "deployment_sha256": "82b7304ce4c8351a79f0de20a051e1489cb398b6f14b420b832150db169c9e6b"
+    },
+    {
+      "path": "projects/sam3d/train_complete106k.sh",
+      "release_sha256": "561c1ef81944c00fc5ed868f645027582be9c187a1a143e261c5d83906aa7db7"
+    },
+    {
+      "path": "projects/sam3d/train_v93.sh",
+      "release_sha256": "d2a8d52c257888b7eed1b114dc3a5a1feb3ca648aea177b2f7e0c3dfc1f09b7f",
+      "deployment_sha256": "4acbf4c00488ecdaad6e89efe5c6b9071641b9060db67acd989696aad19983a8"
+    },
+    {
+      "path": "tests/sam3d/test_action_alignment.py",
+      "release_sha256": "3c9661e4545cc202e8938c9aa59f022937bf03c769126f2ea46c901deb123b40",
+      "deployment_sha256": "3c9661e4545cc202e8938c9aa59f022937bf03c769126f2ea46c901deb123b40"
+    },
+    {
+      "path": "tests/sam3d/test_action_conditioning.py",
+      "release_sha256": "7f72c950eb6c030679a4f1e03b6b636c7861aadcfa0d090483b6d8bd2a62af50",
+      "deployment_sha256": "7f72c950eb6c030679a4f1e03b6b636c7861aadcfa0d090483b6d8bd2a62af50"
+    },
+    {
+      "path": "tests/sam3d/test_action_model_wiring.py",
+      "release_sha256": "37b0afdd787d63f9fcaecd29fbbad01b13a3218d118afeced6c1251283ea32a6",
+      "deployment_sha256": "37b0afdd787d63f9fcaecd29fbbad01b13a3218d118afeced6c1251283ea32a6"
+    },
+    {
+      "path": "tests/sam3d/test_release_launchers.py",
+      "release_sha256": "8ef1019fd84d3e862d95d938661af96bbadb6e32eea5e06a12593dc815320d65"
+    },
+    {
+      "path": "tests/sam3d/test_sam3d_action_dataset.py",
+      "release_sha256": "b5653709825f2c84886375d348fdab68786afd6b90c40e65bd96dc6c838c4ae0",
+      "deployment_sha256": "b5653709825f2c84886375d348fdab68786afd6b90c40e65bd96dc6c838c4ae0"
+    },
+    {
+      "path": "tests/sam3d/test_temporal_action_conditioner.py",
+      "release_sha256": "96b42bd9c22f948a0daae836ffbee7ecddc01baa54f63f640ea3cf8c3e82c69b",
+      "deployment_sha256": "96b42bd9c22f948a0daae836ffbee7ecddc01baa54f63f640ea3cf8c3e82c69b"
+    },
+    {
+      "path": "tests/sam3d/test_video_mask_supervision.py",
+      "release_sha256": "4279100aa335c72f4f3fa7a2b42b5f0e55d8590c9a52e5785948dcb0dbafca23",
+      "deployment_sha256": "4279100aa335c72f4f3fa7a2b42b5f0e55d8590c9a52e5785948dcb0dbafca23"
+    },
+    {
+      "path": "tests/sam3d/test_worldarena_action_hdf5.py",
+      "release_sha256": "47114796d4808750975e0bcb9b2e86d5c994152b4dbe11d1074997c31c33b24c",
+      "deployment_sha256": "47114796d4808750975e0bcb9b2e86d5c994152b4dbe11d1074997c31c33b24c"
+    }
+  ]
+}

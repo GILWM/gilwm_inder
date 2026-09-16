@@ -111,6 +111,14 @@ def load_sam3d_condition_cache(path: str) -> dict[str, torch.Tensor]:
     shapes: dict[str, tuple[int, ...]] = {}
     for source_key, (target_key, expected_ndim) in _SAM3D_CACHE_FIELDS.items():
         value = cache.get(source_key, cache.get(target_key))
+        # Teacher/DINO tokens are deliberately omitted by the current
+        # ``nodino_full`` inference sidecars.  Training with
+        # sam3d_teacher_tokens_as_condition=False supplies the same zero
+        # placeholder, so mirror that behavior instead of rejecting an
+        # otherwise complete SAM + SAM3D condition.
+        if value is None and source_key == "sam3d_tokens":
+            value = torch.zeros((1, 1, 768), dtype=torch.float32)
+            log.info(f"SAM 3D cache has no teacher tokens; using a zero placeholder: {path}")
         if value is None:
             raise KeyError(f"SAM 3D condition cache is missing {source_key!r}: {path}")
         tensor = torch.as_tensor(value, dtype=torch.float32)
@@ -155,7 +163,13 @@ def resize_input(video: torch.Tensor, resolution: list[int]):
     return video_cropped
 
 
-def read_and_process_image(img_path: str, resolution: list[int], num_video_frames: int, resize: bool = True):
+def read_and_process_image(
+    img_path: str,
+    resolution: list[int],
+    num_video_frames: int,
+    resize: bool = True,
+    first_frame_resize_resolution: tuple[int, int] | None = None,
+):
     """
     Reads an image, converts it to a video tensor, and processes it for model input.
 
@@ -184,6 +198,14 @@ def read_and_process_image(img_path: str, resolution: list[int], num_video_frame
 
     # Convert to tensor
     img = torchvision.transforms.functional.to_tensor(img)
+    if first_frame_resize_resolution is not None:
+        source_resolution = tuple(img.shape[-2:])
+        img = resize_input(img.unsqueeze(0), first_frame_resize_resolution).squeeze(0)
+        log.info(
+            "First-frame pre-resize enabled: "
+            f"source={source_resolution} -> pre_resize={first_frame_resize_resolution} "
+            f"-> model_resolution={tuple(resolution)}"
+        )
     # Create a video tensor by repeating the first frame
     vid_input = img.unsqueeze(0)  # Add temporal dimension T=1
 
@@ -414,6 +436,11 @@ class Video2WorldInference:
         if self.context_parallel_size > 1:
             model.net.enable_context_parallel(self.process_group)
 
+        # Checkpoint construction follows the training code path and leaves
+        # modules in train mode. Inference must switch the complete model to
+        # eval explicitly; otherwise action dropout is sampled independently
+        # at every denoising call and produces unstable, mismatched results.
+        model.eval()
         self.model = model
         self.config = config
         self.batch_size = 1
@@ -445,7 +472,9 @@ class Video2WorldInference:
         use_neg_prompt: bool = True,
         camera: CameraConditionInputs | None = None,
         action: torch.Tensor | None = None,
+        action_context: torch.Tensor | None = None,
         sam3d_conditions: dict[str, torch.Tensor] | None = None,
+        fps: int = 24,
     ):
         """
         Prepares the input data batch for the diffusion model.
@@ -467,15 +496,39 @@ class Video2WorldInference:
             dict: A dictionary containing the prepared data batch, moved to the correct device and dtype.
         """
         B, C, T, H, W = video.shape
+        if int(fps) <= 0:
+            raise ValueError(f"fps must be positive, got {fps}")
 
+        if action is not None and (action.ndim != 2 or action.shape[0] != T):
+            raise ValueError(f"action must be frame-aligned [T,D] with T={T}, got {tuple(action.shape)}")
+        action_B_T_D = action.unsqueeze(0).expand(B, -1, -1) if action is not None else None
+        if action_context is not None:
+            if action is None:
+                raise ValueError("action_context requires a frame-aligned action tensor")
+            if action_context.ndim != 2 or action_context.shape[1] != action.shape[1]:
+                raise ValueError(
+                    "action_context must be [T_context,D] with the same action dimension, "
+                    f"got {tuple(action_context.shape)} for action {tuple(action.shape)}"
+                )
+            conditioned_action_B_T_D = action_context.unsqueeze(0).expand(B, -1, -1)
+        else:
+            conditioned_action_B_T_D = action_B_T_D
         data_batch = {
             "dataset_name": "video_data",
             "video": video,
-            "action": action.unsqueeze(0) if action is not None else None,
-            "fps": torch.randint(16, 32, (self.batch_size,)).float(),  # Random FPS (might be used by model)
+            "action": action_B_T_D,
+            # FPS modulates the temporal RoPE.  It must be stable across every
+            # AR chunk and recorded with the inference sample; randomizing it
+            # here changes the model's time scale independently per chunk.
+            "fps": torch.full((self.batch_size,), float(fps), dtype=torch.float32),
             "padding_mask": torch.zeros(self.batch_size, 1, H, W),  # Padding mask (assumed no padding here)
             "num_conditional_frames": num_conditional_frames,  # Specify number of conditional frames
         }
+        if action is not None:
+            # Official action models consume `action`; the SAM3D action-
+            # conditioned model consumes these explicit conditioner keys.
+            data_batch["actions_B_T_D"] = conditioned_action_B_T_D
+            data_batch["action_valid_B"] = torch.ones(B, dtype=torch.bool)
         if sam3d_conditions is not None:
             data_batch.update(sam3d_conditions)
         if camera is not None:
@@ -522,16 +575,19 @@ class Video2WorldInference:
         prompt: str,
         input_path: str | torch.Tensor | None,
         sam3d_condition_path: str | None = None,
+        first_frame_resize_resolution: str | None = None,
         guidance: int = 7,
         num_video_frames: int = 77,
         num_latent_conditional_frames: int = 1,
         num_input_video: int = 1,
         num_output_video: int = 1,
         resolution: str = "192,320",
+        fps: int = 24,
         seed: int = 1,
         negative_prompt: str = _DEFAULT_NEGATIVE_PROMPT,
         camera: CameraConditionInputs | None = None,
         action: torch.Tensor | None = None,
+        action_context: torch.Tensor | None = None,
         num_steps: int = 35,
     ):
         """
@@ -543,6 +599,7 @@ class Video2WorldInference:
         Args:
             prompt: The text prompt describing the desired video content/style.
             input_path: Path to the input image or video file or a torch.Tensor.
+            first_frame_resize_resolution: Optional H,W used to pre-resize an image before model-resolution preprocessing.
             guidance: Classifier-free guidance scale. Defaults to 7.
             num_video_frames: Number of video frames to generate. Defaults to 77.
             num_latent_conditional_frames : Number of latent conditional frames. Defaults to 1.
@@ -551,6 +608,7 @@ class Video2WorldInference:
             negative_prompt: Custom negative prompt. Defaults to the predefined default negative prompt.
             camera: CameraConditionInputs containing extrinsics, intrinsics, and optional image size metadata.
             action: Target robot action for the K output videos. Must be provided if model is action conditioned.
+            action_context: Optional action sequence with a symmetric temporal halo for the SAM3D conditioner.
             num_steps: Number of generation steps. Defaults to 35.
             offload_diffusion_model: If True, offload diffusion model to CPU to save GPU memory. Defaults to False.
             offload_text_encoder: If True, offload text encoder to CPU to save GPU memory. Defaults to False.
@@ -571,6 +629,11 @@ class Video2WorldInference:
             video_resolution = resolution.split(",")
             video_resolution = tuple([int(x) for x in video_resolution])
             assert len(video_resolution) == 2, "Resolution must be in 'H,W' format"
+        pre_resize_resolution = None
+        if first_frame_resize_resolution is not None:
+            pre_resize_resolution = tuple(int(x) for x in first_frame_resize_resolution.split(","))
+            if len(pre_resize_resolution) != 2 or any(value <= 0 for value in pre_resize_resolution):
+                raise ValueError("first_frame_resize_resolution must use positive integer H,W")
 
         # Standard (non-autoregressive) inference must honor the requested output
         # length. The upstream default state_t=24 maps to 93 pixel frames; without
@@ -606,8 +669,11 @@ class Video2WorldInference:
                     resolution=video_resolution,
                     num_video_frames=model_required_frames,
                     resize=True,
+                    first_frame_resize_resolution=pre_resize_resolution,
                 )
             elif ext in _VIDEO_EXTENSIONS:
+                if pre_resize_resolution is not None:
+                    raise ValueError("first_frame_resize_resolution is supported only for image inputs")
                 log.info(f"Processing video input: {input_path}")
                 vid_input = read_and_process_video(
                     video_path=input_path,
@@ -627,11 +693,17 @@ class Video2WorldInference:
 
         # Prepare the data batch with text embeddings
         # Note: TextEncoder.compute_text_embeddings_online() will automatically move its model to GPU
+        if action is not None and (action.ndim != 2 or action.shape[0] != model_required_frames):
+            raise ValueError(
+                f"Single-chunk action must be [{model_required_frames},D], got {tuple(action.shape)}"
+            )
         data_batch = self._get_data_batch_input(
             video=vid_input,
             prompt=prompt,
             camera=camera,
             action=action,
+            action_context=action_context,
+            fps=fps,
             num_conditional_frames=num_latent_conditional_frames,
             negative_prompt=negative_prompt,
             use_neg_prompt=True,
@@ -751,12 +823,14 @@ class Video2WorldInference:
         self,
         prompt: str,
         input_path: str | torch.Tensor | None,
+        first_frame_resize_resolution: str | None,
         num_output_frames: int,
         chunk_size: int,
         chunk_overlap: int,
         guidance: int = 7,
         num_latent_conditional_frames: int = 1,
         resolution: str = "192,320",
+        fps: int = 24,
         seed: int = 1,
         negative_prompt: str = _DEFAULT_NEGATIVE_PROMPT,
         camera: torch.Tensor | None = None,
@@ -770,6 +844,7 @@ class Video2WorldInference:
         Args:
             prompt: The text prompt describing the desired video content/style.
             input_path: Path to the input image or video file or a torch.Tensor.
+            first_frame_resize_resolution: Optional H,W used to pre-resize the initial image before the 640x480 model input.
             num_output_frames: Total number of frames to generate in the final output.
             chunk_size: Number of pixel frames per chunk (model's native capacity).
             chunk_overlap: Number of overlapping pixel frames between consecutive chunks.
@@ -793,6 +868,11 @@ class Video2WorldInference:
             video_resolution = resolution.split(",")
             video_resolution = tuple([int(x) for x in video_resolution])
             assert len(video_resolution) == 2, "Resolution must be in 'H,W' format"
+        pre_resize_resolution = None
+        if first_frame_resize_resolution is not None:
+            pre_resize_resolution = tuple(int(x) for x in first_frame_resize_resolution.split(","))
+            if len(pre_resize_resolution) != 2 or any(value <= 0 for value in pre_resize_resolution):
+                raise ValueError("first_frame_resize_resolution must use positive integer H,W")
 
         # Autoregressive chunks define the model's native temporal window.  A
         # checkpoint may have been saved with a different training length
@@ -830,6 +910,14 @@ class Video2WorldInference:
                 img = Image.open(input_path)
                 img = torchvision.transforms.functional.to_tensor(img)
                 img = img.unsqueeze(0)  # Add temporal dimension T=1
+                if pre_resize_resolution is not None:
+                    source_resolution = tuple(img.shape[-2:])
+                    img = resize_input(img, pre_resize_resolution)
+                    log.info(
+                        "First-frame pre-resize enabled for autoregressive inference: "
+                        f"source={source_resolution} -> pre_resize={pre_resize_resolution} "
+                        f"-> model_resolution={video_resolution}"
+                    )
                 img = (img * 255.0).to(torch.uint8)
                 if video_resolution:
                     img = resize_input(img, video_resolution)
@@ -837,6 +925,8 @@ class Video2WorldInference:
                 full_input_video = torch.cat([img, torch.zeros_like(img).repeat(num_output_frames - 1, 1, 1, 1)], dim=0)
                 full_input_video = full_input_video.unsqueeze(0).permute(0, 2, 1, 3, 4)
             elif ext in _VIDEO_EXTENSIONS:
+                if pre_resize_resolution is not None:
+                    raise ValueError("first_frame_resize_resolution is supported only for image inputs")
                 log.info(f"Processing video input for autoregressive: {input_path}")
                 # Load video and extend to full length if needed
                 video_frames, _ = easy_io.load(input_path)
@@ -891,6 +981,18 @@ class Video2WorldInference:
 
         # Initialize output
         generated_chunks = []
+
+        if action is not None and (action.ndim != 2 or action.shape[0] != num_output_frames):
+            raise ValueError(
+                f"Autoregressive action must be [{num_output_frames},D], got {tuple(action.shape)}"
+            )
+
+        action_context_radius = 0
+        action_network = self.model.net.base_model if hasattr(self.model.net, "base_model") else self.model.net
+        action_conditioner = getattr(action_network, "action_chunk_conditioner", None)
+        temporal_mixer = getattr(action_conditioner, "temporal_mixer", None)
+        if temporal_mixer is not None:
+            action_context_radius = int(temporal_mixer.radius)
 
         # Calculate number of chunks
         # Note: All chunks generate chunk_size frames, we store all of chunk 0 and (chunk_size - chunk_overlap) from others
@@ -947,6 +1049,25 @@ class Video2WorldInference:
                 chunk_latent_conditional = self.model.tokenizer.get_latent_num_frames(chunk_overlap)
 
             # Generate chunk
+            chunk_action = None
+            chunk_action_context = None
+            if action is not None:
+                chunk_action = action[start_frame:end_frame]
+                if actual_chunk_size < model_required_frames:
+                    chunk_action = torch.cat(
+                        [
+                            chunk_action,
+                            chunk_action[-1:].repeat(model_required_frames - actual_chunk_size, 1),
+                        ],
+                        dim=0,
+                    )
+                if action_context_radius > 0:
+                    context_indices = torch.arange(
+                        start_frame - action_context_radius,
+                        start_frame + model_required_frames + action_context_radius,
+                        device=action.device,
+                    ).clamp(0, num_output_frames - 1)
+                    chunk_action_context = action.index_select(0, context_indices)
             chunk_video = self.generate_vid2world(
                 prompt=prompt,
                 input_path=chunk_input,
@@ -955,10 +1076,12 @@ class Video2WorldInference:
                 num_video_frames=model_required_frames,
                 num_latent_conditional_frames=chunk_latent_conditional,
                 resolution=resolution,
+                fps=fps,
                 seed=seed + chunk_idx,
                 negative_prompt=negative_prompt,
                 camera=camera,
-                action=action,
+                action=chunk_action,
+                action_context=chunk_action_context,
                 num_steps=num_steps,
             )  # Returns (1, C, T, H, W)
 

@@ -1766,6 +1766,8 @@ class MiniTrainDIT(WeightTrainingStat):
         crossattn_already_projected: bool = False,
         sam_context_emb: Optional[torch.Tensor] = None,
         sam_context_block_gates: Optional[torch.Tensor] = None,
+        t_embedding_addition_B_T_D: Optional[torch.Tensor] = None,
+        adaln_lora_addition_B_T_3D: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Args:
@@ -1798,6 +1800,44 @@ class MiniTrainDIT(WeightTrainingStat):
             if timesteps_B_T.ndim == 1:
                 timesteps_B_T = timesteps_B_T.unsqueeze(1)
             t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
+            if t_embedding_addition_B_T_D is not None:
+                if (
+                    t_embedding_addition_B_T_D.ndim != 3
+                    or t_embedding_addition_B_T_D.shape[0] != t_embedding_B_T_D.shape[0]
+                    or t_embedding_addition_B_T_D.shape[2] != t_embedding_B_T_D.shape[2]
+                    or (
+                        t_embedding_addition_B_T_D.shape[1] != t_embedding_B_T_D.shape[1]
+                        and t_embedding_B_T_D.shape[1] != 1
+                        and t_embedding_addition_B_T_D.shape[1] != 1
+                    )
+                ):
+                    raise ValueError(
+                        "timestep conditioning shape mismatch: "
+                        f"expected {tuple(t_embedding_B_T_D.shape)}, "
+                        f"got {tuple(t_embedding_addition_B_T_D.shape)}"
+                    )
+                t_embedding_B_T_D = t_embedding_B_T_D + t_embedding_addition_B_T_D.to(
+                    device=t_embedding_B_T_D.device, dtype=t_embedding_B_T_D.dtype
+                )
+            if adaln_lora_addition_B_T_3D is not None:
+                if (
+                    adaln_lora_addition_B_T_3D.ndim != 3
+                    or adaln_lora_addition_B_T_3D.shape[0] != adaln_lora_B_T_3D.shape[0]
+                    or adaln_lora_addition_B_T_3D.shape[2] != adaln_lora_B_T_3D.shape[2]
+                    or (
+                        adaln_lora_addition_B_T_3D.shape[1] != adaln_lora_B_T_3D.shape[1]
+                        and adaln_lora_B_T_3D.shape[1] != 1
+                        and adaln_lora_addition_B_T_3D.shape[1] != 1
+                    )
+                ):
+                    raise ValueError(
+                        "AdaLN conditioning shape mismatch: "
+                        f"expected {tuple(adaln_lora_B_T_3D.shape)}, "
+                        f"got {tuple(adaln_lora_addition_B_T_3D.shape)}"
+                    )
+                adaln_lora_B_T_3D = adaln_lora_B_T_3D + adaln_lora_addition_B_T_3D.to(
+                    device=adaln_lora_B_T_3D.device, dtype=adaln_lora_B_T_3D.dtype
+                )
             t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
             if self.use_wan_fp32_strategy:
                 # Transformer Engine RMSNorm on MUSA returns bf16 here, while

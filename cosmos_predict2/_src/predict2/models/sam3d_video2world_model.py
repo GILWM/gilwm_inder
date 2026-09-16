@@ -36,6 +36,37 @@ class SAM3DVideo2WorldModelRectifiedFlowConfig(Video2WorldModelRectifiedFlowConf
     sam3d_repa_mode: str = "relation"
     sam3d_repa_grid_size: int = 16
     sam3d_repa_temporal_weight: float = 0.25
+    # Optional inverse-dynamics supervision. The prediction term is MSE in
+    # normalized action space; the alignment term compares per-time latent and
+    # encoded-action directions. Defaults preserve all historical runs.
+    action_loss_weight: float = 0.0
+    action_alignment_weight: float = 0.1
+    action_feature_layer: int = 7
+    # A feature pyramid is used only by the Cosmos action expert.  Empty keeps
+    # the historical single-layer lightweight head and all old configs intact.
+    action_feature_layers: tuple[int, ...] = ()
+    # Frozen SAM 3 video teacher supervision.  The outer weight controls the
+    # direct focal+Dice mask objective; the tracking weight scales stable-ID
+    # centroid displacement within that auxiliary branch.
+    sam3_video_mask_loss_weight: float = 0.0
+    sam3_video_tracking_weight: float = 0.1
+    sam3_video_mask_feature_layer: int = 7
+
+    def __attrs_post_init__(self):
+        super().__attrs_post_init__()
+        if self.sam3d_repa_weight < 0:
+            raise ValueError("sam3d_repa_weight must be non-negative")
+        if self.action_loss_weight < 0 or self.action_alignment_weight < 0:
+            raise ValueError("action loss weights must be non-negative")
+        if self.action_feature_layer < 0:
+            raise ValueError("action_feature_layer must be non-negative")
+        if self.sam3_video_mask_loss_weight < 0 or self.sam3_video_tracking_weight < 0:
+            raise ValueError("SAM 3 video loss weights must be non-negative")
+        if self.sam3_video_mask_feature_layer < 0:
+            raise ValueError("sam3_video_mask_feature_layer must be non-negative")
+        self.action_feature_layers = tuple(int(layer) for layer in self.action_feature_layers)
+        if any(layer < 0 for layer in self.action_feature_layers):
+            raise ValueError("action_feature_layers must contain only non-negative layer IDs")
 
 
 def _resample_tokens(tokens_B_N_D: torch.Tensor, token_count: int) -> torch.Tensor:
@@ -47,9 +78,9 @@ def _sampled_relations(tokens_B_N_D: torch.Tensor, anchor_count: int) -> torch.T
     anchor_count = min(anchor_count, tokens_B_N_D.shape[1])
     # Student and teacher must use the same spatial anchors.  Evenly spaced
     # anchors are deterministic across distributed ranks and cache versions.
-    anchor_indices = torch.linspace(
-        0, tokens_B_N_D.shape[1] - 1, anchor_count, device=tokens_B_N_D.device
-    ).round().long()
+    anchor_indices = (
+        torch.linspace(0, tokens_B_N_D.shape[1] - 1, anchor_count, device=tokens_B_N_D.device).round().long()
+    )
     anchors = tokens_B_N_D[:, anchor_indices]
     return torch.einsum("bnd,bkd->bnk", tokens_B_N_D, anchors)
 
@@ -61,6 +92,10 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
         self._pending_sam3d_repa_loss: Optional[torch.Tensor] = None
         self._pending_sam3d_repa_spatial_loss: Optional[torch.Tensor] = None
         self._pending_sam3d_repa_temporal_loss: Optional[torch.Tensor] = None
+        self._pending_action_prediction_loss: Optional[torch.Tensor] = None
+        self._pending_action_alignment_loss: Optional[torch.Tensor] = None
+        self._pending_sam3_video_mask_loss: Optional[torch.Tensor] = None
+        self._pending_sam3_video_tracking_loss: Optional[torch.Tensor] = None
         super().__init__(config)
 
     def add_lora(self, network: torch.nn.Module, *args, **kwargs) -> torch.nn.Module:
@@ -79,6 +114,8 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
             "sam3d_shape_projector",
             "sam3d_pose_projector",
             "sam3d_repa_projector",
+            "sam3_video_mask_head",
+            "action_supervision_head",
             "sam_modality_embeddings",
             "sam_context_block_gates",
         )
@@ -89,6 +126,35 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
                 trainable_condition_parameters += parameter.numel()
         log.info(f"Enabled {trainable_condition_parameters:,} trainable SAM condition-adapter parameters")
         return network
+
+    def _action_supervision_head(self) -> torch.nn.Module:
+        network = self.net
+        head = getattr(network, "action_supervision_head", None)
+        if head is None and hasattr(network, "base_model"):
+            head = getattr(network.base_model, "action_supervision_head", None)
+        if head is None:
+            raise RuntimeError(
+                "action_loss_weight > 0 requires model.config.net.action_supervision_hidden_dim to be set"
+            )
+        return head
+
+    def _action_chunk_conditioner(self) -> Optional[torch.nn.Module]:
+        network = self.net
+        conditioner = getattr(network, "action_chunk_conditioner", None)
+        if conditioner is None and hasattr(network, "base_model"):
+            conditioner = getattr(network.base_model, "action_chunk_conditioner", None)
+        return conditioner
+
+    def _sam3_video_mask_head(self) -> torch.nn.Module:
+        network = self.net
+        head = getattr(network, "sam3_video_mask_head", None)
+        if head is None and hasattr(network, "base_model"):
+            head = getattr(network.base_model, "sam3_video_mask_head", None)
+        if head is None:
+            raise RuntimeError(
+                "sam3_video_mask_loss_weight > 0 requires model.config.net.sam3_video_mask_hidden_dim"
+            )
+        return head
 
     def _relation_alignment_loss(
         self,
@@ -106,15 +172,15 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
                 f"DiT token count {student_B_M_D.shape[1]} is not divisible by latent frames {latent_frames}"
             )
         spatial_tokens = student_B_M_D.shape[1] // latent_frames
-        student = student_B_M_D.reshape(
-            student_B_M_D.shape[0], latent_frames, spatial_tokens, student_B_M_D.shape[-1]
-        )
+        student = student_B_M_D.reshape(student_B_M_D.shape[0], latent_frames, spatial_tokens, student_B_M_D.shape[-1])
 
         frame_count = min(self.config.sam3d_repa_frames, student.shape[1], teacher_B_F_N_D.shape[1])
-        student_frame_indices = torch.linspace(0, student.shape[1] - 1, frame_count, device=student.device).round().long()
-        teacher_frame_indices = torch.linspace(
-            0, teacher_B_F_N_D.shape[1] - 1, frame_count, device=teacher_B_F_N_D.device
-        ).round().long()
+        student_frame_indices = (
+            torch.linspace(0, student.shape[1] - 1, frame_count, device=student.device).round().long()
+        )
+        teacher_frame_indices = (
+            torch.linspace(0, teacher_B_F_N_D.shape[1] - 1, frame_count, device=teacher_B_F_N_D.device).round().long()
+        )
         student = student.index_select(1, student_frame_indices)
         teacher = teacher_B_F_N_D.index_select(1, teacher_frame_indices).detach().to(student.device)
 
@@ -137,12 +203,8 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
 
         student_clip = student_spatial.reshape(batch_size, frame_count * token_count, -1)
         teacher_clip = teacher_spatial.reshape(batch_size, frame_count * token_count, -1)
-        student_temporal_relations = _sampled_relations(
-            student_clip, self.config.sam3d_repa_temporal_anchors
-        )
-        teacher_temporal_relations = _sampled_relations(
-            teacher_clip, self.config.sam3d_repa_temporal_anchors
-        )
+        student_temporal_relations = _sampled_relations(student_clip, self.config.sam3d_repa_temporal_anchors)
+        teacher_temporal_relations = _sampled_relations(teacher_clip, self.config.sam3d_repa_temporal_anchors)
         temporal_loss = F.smooth_l1_loss(student_temporal_relations, teacher_temporal_relations)
         return spatial_loss + temporal_loss, spatial_loss, temporal_loss
 
@@ -153,8 +215,7 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
             projector = getattr(network.base_model, "sam3d_repa_projector", None)
         if projector is None:
             raise RuntimeError(
-                "projected_cosine REPA requires net.sam3d_repa_projection_dim "
-                "to match the teacher feature dimension"
+                "projected_cosine REPA requires net.sam3d_repa_projection_dim to match the teacher feature dimension"
             )
         return projector
 
@@ -184,8 +245,7 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
         expected_tokens = latent_frames * student_h * student_w
         if student_B_M_D.shape[1] != expected_tokens:
             raise ValueError(
-                f"DiT token count {student_B_M_D.shape[1]} != "
-                f"T*H*W {latent_frames}*{student_h}*{student_w}"
+                f"DiT token count {student_B_M_D.shape[1]} != T*H*W {latent_frames}*{student_h}*{student_w}"
             )
         student = student_B_M_D.reshape(
             student_B_M_D.shape[0], latent_frames, student_h, student_w, student_B_M_D.shape[-1]
@@ -193,9 +253,9 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
 
         frame_count = min(self.config.sam3d_repa_frames, student.shape[1], teacher_B_F_N_D.shape[1])
         student_indices = torch.linspace(0, student.shape[1] - 1, frame_count, device=student.device).round().long()
-        teacher_indices = torch.linspace(
-            0, teacher_B_F_N_D.shape[1] - 1, frame_count, device=teacher_B_F_N_D.device
-        ).round().long()
+        teacher_indices = (
+            torch.linspace(0, teacher_B_F_N_D.shape[1] - 1, frame_count, device=teacher_B_F_N_D.device).round().long()
+        )
         student = student.index_select(1, student_indices)
         teacher = teacher_B_F_N_D.index_select(1, teacher_indices).detach().to(student.device)
 
@@ -264,9 +324,8 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
             condition_video_mask = condition.condition_video_input_mask_B_C_T_H_W.repeat(
                 1, channel_count, 1, 1, 1
             ).type_as(xt_B_C_T_H_W)
-            xt_B_C_T_H_W = (
-                condition_state_in_B_C_T_H_W * condition_video_mask
-                + xt_B_C_T_H_W * (1 - condition_video_mask)
+            xt_B_C_T_H_W = condition_state_in_B_C_T_H_W * condition_video_mask + xt_B_C_T_H_W * (
+                1 - condition_video_mask
             )
 
             if self.config.conditional_frame_timestep >= 0:
@@ -274,36 +333,73 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
                 timestep_cond_B_1_T_1_1 = (
                     torch.ones_like(condition_video_mask_B_1_T_1_1) * self.config.conditional_frame_timestep
                 )
-                timesteps_B_1_T_1_1 = (
-                    timestep_cond_B_1_T_1_1 * condition_video_mask_B_1_T_1_1
-                    + timesteps_B_T * (1 - condition_video_mask_B_1_T_1_1)
+                timesteps_B_1_T_1_1 = timestep_cond_B_1_T_1_1 * condition_video_mask_B_1_T_1_1 + timesteps_B_T * (
+                    1 - condition_video_mask_B_1_T_1_1
                 )
                 timesteps_B_T = timesteps_B_1_T_1_1.squeeze()
                 if timesteps_B_T.ndim == 1:
                     timesteps_B_T = timesteps_B_T.unsqueeze(0)
 
         collect_repa = (
-            self.training
-            and self.config.sam3d_repa_weight > 0
-            and condition.sam3d_tokens_B_F_N_D is not None
+            self.training and self.config.sam3d_repa_weight > 0 and condition.sam3d_tokens_B_F_N_D is not None
+        )
+        collect_action = self.training and self.config.action_loss_weight > 0
+        collect_video_masks = self.training and getattr(self.config, "sam3_video_mask_loss_weight", 0.0) > 0
+        if collect_action and condition.actions_B_T_D is None:
+            raise RuntimeError(
+                "Action supervision is enabled but the batch has no actions_B_T_D. "
+                "Set dataloader action_hdf5_root/action_required or disable action_loss_weight."
+            )
+        action_head = self._action_supervision_head() if collect_action else None
+        if collect_video_masks and (
+            condition.sam3_video_masks_B_T_K_H_W is None or condition.sam3_video_valid_B_T_K is None
+        ):
+            raise RuntimeError(
+                "SAM 3 video supervision is enabled but the batch has no aligned teacher masks/validity"
+            )
+        video_mask_head = self._sam3_video_mask_head() if collect_video_masks else None
+        use_action_pyramid = bool(action_head is not None and getattr(action_head, "uses_feature_pyramid", False))
+        configured_action_layers = tuple(getattr(self.config, "action_feature_layers", ()))
+        action_feature_ids = (
+            list(configured_action_layers)
+            if use_action_pyramid and configured_action_layers
+            else [self.config.action_feature_layer]
+        )
+        feature_ids = sorted(
+            {
+                *([self.config.sam3d_repa_layer] if collect_repa else []),
+                *(action_feature_ids if collect_action else []),
+                *([getattr(self.config, "sam3_video_mask_feature_layer", 7)] if collect_video_masks else []),
+            }
         )
         net_result = self.net(
             x_B_C_T_H_W=xt_B_C_T_H_W.to(**self.tensor_kwargs),
             timesteps_B_T=timesteps_B_T,
-            intermediate_feature_ids=[self.config.sam3d_repa_layer] if collect_repa else None,
+            intermediate_feature_ids=feature_ids or None,
             **condition.to_dict(),
         )
-        if collect_repa:
+        feature_by_id: dict[int, torch.Tensor] = {}
+        if feature_ids:
             net_output_B_C_T_H_W, intermediate_features = net_result
+            if len(intermediate_features) != len(feature_ids):
+                raise RuntimeError(
+                    f"Requested DiT features {feature_ids}, received {len(intermediate_features)} tensors"
+                )
+            feature_by_id = dict(zip(feature_ids, intermediate_features))
+        else:
+            net_output_B_C_T_H_W = net_result
+
+        if collect_repa:
+            repa_feature = feature_by_id[self.config.sam3d_repa_layer]
             if self.config.sam3d_repa_mode == "relation":
                 losses = self._relation_alignment_loss(
-                    intermediate_features[-1],
+                    repa_feature,
                     condition.sam3d_tokens_B_F_N_D,
                     latent_frames=xt_B_C_T_H_W.shape[2],
                 )
             elif self.config.sam3d_repa_mode == "projected_cosine":
                 losses = self._projected_cosine_alignment_loss(
-                    intermediate_features[-1],
+                    repa_feature,
                     condition.sam3d_tokens_B_F_N_D,
                     latent_frames=xt_B_C_T_H_W.shape[2],
                     latent_height=xt_B_C_T_H_W.shape[3],
@@ -317,18 +413,60 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
                 self._pending_sam3d_repa_temporal_loss,
             ) = losses
         else:
-            net_output_B_C_T_H_W = net_result
             self._pending_sam3d_repa_loss = None
             self._pending_sam3d_repa_spatial_loss = None
             self._pending_sam3d_repa_temporal_loss = None
+
+        if collect_action:
+            action_features = [feature_by_id[layer] for layer in action_feature_ids]
+            action_input = action_features if use_action_pyramid else action_features[-1]
+            action_network = self.net.base_model if hasattr(self.net, "base_model") else self.net
+            patch_spatial = int(getattr(action_network, "patch_spatial", 2))
+            action_kwargs = dict(
+                latent_frames=xt_B_C_T_H_W.shape[2],
+                valid_B=condition.action_valid_B,
+            )
+            if use_action_pyramid:
+                action_kwargs.update(
+                    spatial_shape=(
+                        xt_B_C_T_H_W.shape[3] // patch_spatial,
+                        xt_B_C_T_H_W.shape[4] // patch_spatial,
+                    ),
+                    timesteps_B_T=timesteps_B_T,
+                )
+            action_losses = action_head(action_input, condition.actions_B_T_D, **action_kwargs)
+            self._pending_action_prediction_loss = action_losses.prediction
+            self._pending_action_alignment_loss = action_losses.alignment
+        else:
+            self._pending_action_prediction_loss = None
+            self._pending_action_alignment_loss = None
+
+        if collect_video_masks:
+            video_feature = feature_by_id[getattr(self.config, "sam3_video_mask_feature_layer", 7)]
+            video_network = self.net.base_model if hasattr(self.net, "base_model") else self.net
+            patch_spatial = int(getattr(video_network, "patch_spatial", 2))
+            video_losses = video_mask_head(
+                video_feature,
+                condition.sam3_video_masks_B_T_K_H_W,
+                condition.sam3_video_valid_B_T_K,
+                latent_frames=xt_B_C_T_H_W.shape[2],
+                spatial_shape=(
+                    xt_B_C_T_H_W.shape[3] // patch_spatial,
+                    xt_B_C_T_H_W.shape[4] // patch_spatial,
+                ),
+            )
+            self._pending_sam3_video_mask_loss = video_losses.mask
+            self._pending_sam3_video_tracking_loss = video_losses.tracking
+        else:
+            self._pending_sam3_video_mask_loss = None
+            self._pending_sam3_video_tracking_loss = None
         net_output_B_C_T_H_W = net_output_B_C_T_H_W.float()
 
         if condition.is_video and self.config.denoise_replace_gt_frames:
             gt_frames_x0 = condition.gt_frames.type_as(net_output_B_C_T_H_W)
             gt_frames_velocity = noise - gt_frames_x0
-            net_output_B_C_T_H_W = (
-                gt_frames_velocity * condition_video_mask
-                + net_output_B_C_T_H_W * (1 - condition_video_mask)
+            net_output_B_C_T_H_W = gt_frames_velocity * condition_video_mask + net_output_B_C_T_H_W * (
+                1 - condition_video_mask
             )
         return net_output_B_C_T_H_W
 
@@ -336,16 +474,79 @@ class SAM3DVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
         self._pending_sam3d_repa_loss = None
         self._pending_sam3d_repa_spatial_loss = None
         self._pending_sam3d_repa_temporal_loss = None
+        self._pending_action_prediction_loss = None
+        self._pending_action_alignment_loss = None
+        self._pending_sam3_video_mask_loss = None
+        self._pending_sam3_video_tracking_loss = None
         output_batch, diffusion_loss = super().forward(data_batch)
         repa_loss = self._pending_sam3d_repa_loss
         if repa_loss is None:
             repa_loss = diffusion_loss.new_zeros(())
-        total_loss = diffusion_loss + self.config.sam3d_repa_weight * repa_loss
+        action_prediction_loss = self._pending_action_prediction_loss
+        if action_prediction_loss is None:
+            action_prediction_loss = diffusion_loss.new_zeros(())
+        action_alignment_loss = self._pending_action_alignment_loss
+        if action_alignment_loss is None:
+            action_alignment_loss = diffusion_loss.new_zeros(())
+        action_supervision_loss = action_prediction_loss + self.config.action_alignment_weight * action_alignment_loss
+        video_mask_loss = self._pending_sam3_video_mask_loss
+        if video_mask_loss is None:
+            video_mask_loss = diffusion_loss.new_zeros(())
+        video_tracking_loss = self._pending_sam3_video_tracking_loss
+        if video_tracking_loss is None:
+            video_tracking_loss = diffusion_loss.new_zeros(())
+        video_supervision_loss = video_mask_loss + getattr(
+            self.config, "sam3_video_tracking_weight", 0.1
+        ) * video_tracking_loss
+        total_loss = (
+            diffusion_loss
+            + self.config.sam3d_repa_weight * repa_loss
+            + self.config.action_loss_weight * action_supervision_loss
+            + getattr(self.config, "sam3_video_mask_loss_weight", 0.0) * video_supervision_loss
+        )
         output_batch["diffusion_loss"] = diffusion_loss
         output_batch["sam3d_repa_loss"] = repa_loss
         if self._pending_sam3d_repa_spatial_loss is not None:
             output_batch["sam3d_repa_spatial_loss"] = self._pending_sam3d_repa_spatial_loss
         if self._pending_sam3d_repa_temporal_loss is not None:
             output_batch["sam3d_repa_temporal_loss"] = self._pending_sam3d_repa_temporal_loss
+        output_batch["action_prediction_loss"] = action_prediction_loss
+        output_batch["action_alignment_loss"] = action_alignment_loss
+        output_batch["action_supervision_loss"] = action_supervision_loss
+        output_batch["sam3_video_mask_loss"] = video_mask_loss
+        output_batch["sam3_video_tracking_loss"] = video_tracking_loss
+        output_batch["sam3_video_supervision_loss"] = video_supervision_loss
+        action_conditioner = self._action_chunk_conditioner()
+        if action_conditioner is not None:
+            output_batch["action_conditioning_scale"] = diffusion_loss.new_tensor(
+                action_conditioner.residual_scale
+            )
+            temporal_mixer = getattr(action_conditioner, "temporal_mixer", None)
+            if temporal_mixer is not None:
+                # FSDP2 exposes these tiny parameters as sharded DTensors.
+                # Metrics are detached from the loss, so materialize their
+                # full 9/14-element values before combining with ordinary
+                # tensors. This avoids mixed Tensor/DTensor operations while
+                # keeping the actual trainable forward path sharded.
+                def metric_tensor(parameter: torch.Tensor) -> torch.Tensor:
+                    value = parameter.detach()
+                    if hasattr(value, "full_tensor"):
+                        value = value.full_tensor()
+                    return value.float()
+
+                output_batch["action_temporal_mix_gate_abs"] = torch.tanh(
+                    metric_tensor(temporal_mixer.mix_gate)
+                ).abs().mean()
+                output_batch["action_temporal_delta_gate_abs"] = torch.tanh(
+                    metric_tensor(temporal_mixer.delta_gate)
+                ).abs().mean()
+                prior = torch.softmax(metric_tensor(temporal_mixer.relative_logits), dim=0)
+                offsets = torch.arange(
+                    -temporal_mixer.radius,
+                    temporal_mixer.radius + 1,
+                    device=prior.device,
+                    dtype=prior.dtype,
+                )
+                output_batch["action_temporal_prior_offset"] = (prior * offsets).sum()
         output_batch["edm_loss"] = total_loss
         return output_batch, total_loss

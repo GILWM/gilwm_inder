@@ -60,6 +60,16 @@ class IterSpeed(EveryN):
                 "sam3d_repa_loss",
                 "sam3d_repa_spatial_loss",
                 "sam3d_repa_temporal_loss",
+                "action_prediction_loss",
+                "action_alignment_loss",
+                "action_supervision_loss",
+                "action_conditioning_scale",
+                "action_temporal_mix_gate_abs",
+                "action_temporal_delta_gate_abs",
+                "action_temporal_prior_offset",
+                "sam3_video_mask_loss",
+                "sam3_video_tracking_loss",
+                "sam3_video_supervision_loss",
             )
             if key in output_batch and output_batch[key].numel() == 1
         )
@@ -100,12 +110,21 @@ class IterSpeed(EveryN):
                 "sam3d_repa_loss",
                 "sam3d_repa_spatial_loss",
                 "sam3d_repa_temporal_loss",
+                "action_prediction_loss",
+                "action_alignment_loss",
+                "action_supervision_loss",
+                "action_conditioning_scale",
+                "action_temporal_mix_gate_abs",
+                "action_temporal_delta_gate_abs",
+                "action_temporal_prior_offset",
+                "sam3_video_mask_loss",
+                "sam3_video_tracking_loss",
+                "sam3_video_supervision_loss",
             )
             if key in output_batch and output_batch[key].numel() == 1
         )
         log.info(
-            f"{iteration} : iter_speed {iter_speed:.2f} seconds per iteration | "
-            f"Loss: {loss.item():.4f}{component_text}"
+            f"{iteration} : iter_speed {iter_speed:.2f} seconds per iteration | Loss: {loss.item():.4f}{component_text}"
         )
 
         if wandb.run:

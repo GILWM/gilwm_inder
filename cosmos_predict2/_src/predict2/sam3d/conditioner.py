@@ -28,6 +28,15 @@ class SAM3DVideo2WorldCondition(Video2WorldCondition):
     # (translation xyz, quaternion wxyz, scale xyz).
     sam3d_shape_latents_B_K_N_D: Optional[torch.Tensor] = None
     sam3d_object_pose_B_K_D: Optional[torch.Tensor] = None
+    # Frame-aligned action conditions.  They are preserved for both training
+    # and inference; classifier-free text/video dropout never removes them.
+    actions_B_T_D: Optional[torch.Tensor] = None
+    action_valid_B: Optional[torch.Tensor] = None
+    # Training-only frozen SAM 3 video targets aligned to Cosmos latent time.
+    # They are consumed by an auxiliary decoder head and ignored by the DiT
+    # conditioning path, so inference never requires future video masks.
+    sam3_video_masks_B_T_K_H_W: Optional[torch.Tensor] = None
+    sam3_video_valid_B_T_K: Optional[torch.Tensor] = None
 
 
 class SAM3DVideo2WorldConditioner(GeneralConditioner):
@@ -38,6 +47,10 @@ class SAM3DVideo2WorldConditioner(GeneralConditioner):
         "sam3d_geometry_B_C_H_W",
         "sam3d_shape_latents_B_K_N_D",
         "sam3d_object_pose_B_K_D",
+        "actions_B_T_D",
+        "action_valid_B",
+        "sam3_video_masks_B_T_K_H_W",
+        "sam3_video_valid_B_T_K",
     )
 
     def forward(
@@ -123,5 +136,29 @@ SAM3DVideoPredictionConditioner: LazyDict = L(SAM3DVideo2WorldConditioner)(
         output_key="sam3d_object_pose_B_K_D",
         dropout_rate=0.1,
         dtype="bfloat16",
+    ),
+    actions=L(ReMapkey)(
+        input_key="actions_B_T_D",
+        output_key="actions_B_T_D",
+        dropout_rate=0.0,
+        dtype=None,
+    ),
+    action_valid=L(ReMapkey)(
+        input_key="action_valid_B",
+        output_key="action_valid_B",
+        dropout_rate=0.0,
+        dtype=None,
+    ),
+    sam3_video_masks=L(ReMapkey)(
+        input_key="sam3_video_masks_B_T_K_H_W",
+        output_key="sam3_video_masks_B_T_K_H_W",
+        dropout_rate=0.0,
+        dtype="bfloat16",
+    ),
+    sam3_video_valid=L(ReMapkey)(
+        input_key="sam3_video_valid_B_T_K",
+        output_key="sam3_video_valid_B_T_K",
+        dropout_rate=0.0,
+        dtype=None,
     ),
 )
